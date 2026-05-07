@@ -218,6 +218,26 @@ def scp_download_file(
 
 
 @mcp.tool()
+def scp_upload_file(
+    host: str,
+    local_path: str,
+    remote_path: str,
+) -> str:
+    """Upload a file from the local machine to a remote host via scp.
+
+    Uses the system scp binary to respect SSH config and multiplex sockets.
+
+    Args:
+        host: SSH config alias or hostname.
+        local_path: Path to the file on the local machine.
+        remote_path: Destination path on the remote host.
+    """
+    _validate_host(host)
+    escaped_remote = shlex.quote(remote_path)
+    return _run(["scp", local_path, f"{host}:{escaped_remote}"])
+
+
+@mcp.tool()
 def check_ssh_connection(host: str) -> str:
     """Check if the SSH ControlMaster multiplex socket for a host is alive.
 
