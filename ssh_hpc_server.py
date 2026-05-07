@@ -188,6 +188,24 @@ def list_slurm_queue(host: str, user: str = "") -> str:
 
 
 @mcp.tool()
+def cancel_slurm_job(host: str, job_id: str) -> str:
+    """Cancel a Slurm job by its job ID.
+
+    Args:
+        host: SSH config alias for the HPC system.
+        job_id: Slurm job ID to cancel (e.g. '12345', '12345_0' for array jobs).
+    """
+    _validate_host(host)
+    if not _VALID_JOB_ID_RE.match(job_id):
+        raise ValueError(
+            f"Invalid Slurm job ID: {job_id!r}. "
+            "Expected numeric ID, optionally with _ or . separators for array/step jobs."
+        )
+    safe_id = f"'{job_id}'"
+    return _run(["ssh", host, f"scancel {safe_id}"])
+
+
+@mcp.tool()
 def read_remote_file(
     host: str,
     remote_path: str,
