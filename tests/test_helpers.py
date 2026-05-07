@@ -23,6 +23,10 @@ class TestValidateHost:
         "host | cat",
         "host\ninjection",
         "host`whoami`",
+        "-V",
+        "-O",
+        "--",
+        "-bad",
     ])
     def test_rejects_invalid_hosts(self, host):
         with pytest.raises(ValueError, match="Invalid SSH host alias"):

@@ -22,7 +22,9 @@ class TestExecuteRemoteBash:
         assert "file1.txt" in result
         mock_subprocess.assert_called_once()
         cmd = mock_subprocess.call_args[0][0]
-        assert cmd == ["ssh", "derecho", "ls"]
+        assert cmd[0] == "ssh"
+        assert cmd[1] == "derecho"
+        assert "bash -c" in cmd[2]
 
     def test_rejects_invalid_host(self):
         with pytest.raises(ValueError):
@@ -52,6 +54,7 @@ class TestSubmitSlurmJob:
         result = submit_slurm_job(
             host="derecho",
             job_script_content="#!/bin/bash\n#SBATCH -N 1\necho hello",
+            remote_filename="test_job.sh",
         )
         assert "12345" in result
         assert mock_subprocess.call_count == 2
@@ -90,6 +93,37 @@ class TestSubmitSlurmJob:
         )
         write_cmd = mock_subprocess.call_args_list[0][0][0][2]
         assert "'" in write_cmd
+
+
+    def test_generates_unique_filename_by_default(self, mock_subprocess):
+        mock_subprocess.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(returncode=0, stdout="Submitted batch job 1\n"),
+        ]
+        submit_slurm_job(host="derecho", job_script_content="#!/bin/bash")
+        write_cmd = mock_subprocess.call_args_list[0][0][0][2]
+        assert "claude_job_" in write_cmd
+        assert ".sh" in write_cmd
+
+    def test_rejects_dash_prefixed_filename(self):
+        with pytest.raises(ValueError, match="must not start with"):
+            submit_slurm_job(host="derecho", job_script_content="#!/bin/bash", remote_filename="-bad.sh")
+
+    def test_sbatch_uses_double_dash(self, mock_subprocess):
+        mock_subprocess.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(returncode=0, stdout="Submitted batch job 1\n"),
+        ]
+        submit_slurm_job(host="derecho", job_script_content="#!/bin/bash", remote_filename="job.sh")
+        submit_cmd = mock_subprocess.call_args_list[1][0][0][2]
+        assert "sbatch --" in submit_cmd
+
+    def test_wraps_command_in_bash(self, mock_subprocess):
+        """execute_remote_bash should force bash regardless of login shell."""
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
+        execute_remote_bash(host="derecho", command="echo hello")
+        cmd = mock_subprocess.call_args[0][0][2]
+        assert cmd.startswith("bash -c ")
 
 
 class TestCheckSlurmJob:
