@@ -10,10 +10,13 @@ Run with:  uv run ssh_hpc_server.py
 import re
 import shlex
 import subprocess
+import uuid
 
 from fastmcp import FastMCP
 
-mcp = FastMCP(name="SSH-HPC-Remote-Control")
+__version__ = "0.3.0"
+
+mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
 DEFAULT_TIMEOUT = 120
 _VALID_HOST_RE = re.compile(r"^[a-zA-Z0-9._@-]+$")
@@ -26,11 +29,12 @@ _VALID_USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 # ---------------------------------------------------------------------------
 
 def _validate_host(host: str) -> None:
-    """Reject host strings that could be used for shell injection."""
-    if not host or not _VALID_HOST_RE.match(host):
+    """Reject host strings that could be used for shell or option injection."""
+    if not host or not _VALID_HOST_RE.match(host) or host.startswith("-"):
         raise ValueError(
             f"Invalid SSH host alias: {host!r}. "
-            "Must contain only alphanumeric characters, dots, hyphens, underscores, or @."
+            "Must contain only alphanumeric characters, dots, hyphens, underscores, or @, "
+            "and must not start with '-'."
         )
 
 
@@ -53,7 +57,9 @@ def _run_raw(
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired as exc:
-        return -1, exc.stdout or "", f"Timed out after {timeout}s. {exc.stderr or ''}"
+        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode(errors="replace")
+        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
+        return -1, stdout, f"Timed out after {timeout}s. {stderr}"
     except FileNotFoundError:
         return -1, "", f"Command not found: {cmd[0]}. Is it installed and on PATH?"
 
@@ -101,14 +107,14 @@ def execute_remote_bash(
         timeout: Max seconds to wait (default 120).
     """
     _validate_host(host)
-    return _run(["ssh", host, command], timeout=timeout)
+    return _run(["ssh", host, f"bash -c {shlex.quote(command)}"], timeout=timeout)
 
 
 @mcp.tool()
 def submit_slurm_job(
     host: str,
     job_script_content: str,
-    remote_filename: str = "claude_job.sh",
+    remote_filename: str = "",
 ) -> str:
     """Write a Slurm batch script to a remote host and submit it with sbatch.
 
@@ -118,20 +124,23 @@ def submit_slurm_job(
     Args:
         host: SSH config alias for the HPC system.
         job_script_content: Full text of the Slurm batch script (including #SBATCH directives).
-        remote_filename: Where to write the script on the remote host.
+        remote_filename: Where to write the script on the remote host. Auto-generated if empty.
     """
     _validate_host(host)
+    if not remote_filename:
+        remote_filename = f"claude_job_{uuid.uuid4().hex[:8]}.sh"
+    if remote_filename.startswith("-"):
+        raise ValueError(f"remote_filename must not start with '-': {remote_filename!r}")
     safe_fn = shlex.quote(remote_filename)
 
-    # Pipe script content to the remote file via stdin
     rc, out, err = _run_raw(
-        ["ssh", host, f"cat > {safe_fn} && chmod +x {safe_fn}"],
+        ["ssh", host, f"cat > {safe_fn} && chmod -- +x {safe_fn}"],
         input_data=job_script_content,
     )
     if rc != 0:
         return f"Failed to write script to {remote_filename}:\n{_format_result(rc, out, err)}"
 
-    return _run(["ssh", host, f"sbatch {safe_fn}"])
+    return _run(["ssh", host, f"sbatch -- {safe_fn}"])
 
 
 @mcp.tool()
@@ -318,5 +327,9 @@ def check_ssh_connection(host: str) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main():
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
