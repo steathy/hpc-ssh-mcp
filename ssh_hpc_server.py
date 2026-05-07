@@ -18,6 +18,7 @@ mcp = FastMCP(name="SSH-HPC-Remote-Control")
 DEFAULT_TIMEOUT = 120
 _VALID_HOST_RE = re.compile(r"^[a-zA-Z0-9._@-]+$")
 _VALID_JOB_ID_RE = re.compile(r"^\d+([_.]\d+)*$")
+_VALID_USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +181,8 @@ def list_slurm_queue(host: str, user: str = "") -> str:
     """
     _validate_host(host)
     if user:
+        if not _VALID_USERNAME_RE.match(user):
+            raise ValueError(f"Invalid username: {user!r}")
         safe_user = shlex.quote(user)
         cmd = f"squeue -u {safe_user} --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R'"
     else:
@@ -249,6 +252,8 @@ def tail_remote_file(
         lines: Number of lines to read from the end (default 50).
     """
     _validate_host(host)
+    if lines < 1:
+        raise ValueError(f"lines must be >= 1, got {lines}")
     safe_path = shlex.quote(remote_path)
     return _run(["ssh", host, f"tail -n {int(lines)} {safe_path}"])
 
