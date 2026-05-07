@@ -59,3 +59,36 @@ class TestScpUploadFile:
         from ssh_hpc_server import scp_upload_file
         with pytest.raises(ValueError):
             scp_upload_file(host="bad; host", local_path="/a", remote_path="/b")
+
+
+class TestListSlurmQueue:
+    def test_queries_squeue(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=0,
+            stdout="JOBID  PARTITION  NAME  USER  ST  TIME  NODES\n12345  main  test  user1  R  1:00  1\n",
+        )
+        from ssh_hpc_server import list_slurm_queue
+        result = list_slurm_queue(host="derecho")
+        assert "12345" in result
+        cmd = mock_subprocess.call_args[0][0][2]
+        assert "squeue" in cmd
+
+    def test_filters_by_user(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="header\n")
+        from ssh_hpc_server import list_slurm_queue
+        list_slurm_queue(host="derecho", user="jsmith")
+        cmd = mock_subprocess.call_args[0][0][2]
+        assert "-u" in cmd
+        assert "jsmith" in cmd
+
+    def test_defaults_to_current_user(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="header\n")
+        from ssh_hpc_server import list_slurm_queue
+        list_slurm_queue(host="derecho")
+        cmd = mock_subprocess.call_args[0][0][2]
+        assert "$USER" in cmd
+
+    def test_rejects_invalid_host(self):
+        from ssh_hpc_server import list_slurm_queue
+        with pytest.raises(ValueError):
+            list_slurm_queue(host="bad; host")

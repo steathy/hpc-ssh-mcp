@@ -169,6 +169,25 @@ def check_slurm_job(host: str, job_id: str) -> str:
 
 
 @mcp.tool()
+def list_slurm_queue(host: str, user: str = "") -> str:
+    """List Slurm jobs in the queue for a user.
+
+    Defaults to the current user ($USER) if no user is specified.
+
+    Args:
+        host: SSH config alias for the HPC system.
+        user: Username to filter by. Defaults to the remote $USER.
+    """
+    _validate_host(host)
+    if user:
+        safe_user = shlex.quote(user)
+        cmd = f"squeue -u {safe_user} --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R'"
+    else:
+        cmd = "squeue -u $USER --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R'"
+    return _run(["ssh", host, cmd])
+
+
+@mcp.tool()
 def read_remote_file(
     host: str,
     remote_path: str,
