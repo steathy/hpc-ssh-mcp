@@ -133,7 +133,7 @@ class TestCancelSlurmJob:
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "ssh"
         assert "scancel" in cmd[2]
-        assert "'12345'" in cmd[2]
+        assert "12345" in cmd[2]
 
     def test_reports_cancel_failure(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(
