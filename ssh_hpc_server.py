@@ -217,6 +217,20 @@ def scp_download_file(
     return _run(["scp", f"{host}:{escaped_remote}", local_path])
 
 
+@mcp.tool()
+def check_ssh_connection(host: str) -> str:
+    """Check if the SSH ControlMaster multiplex socket for a host is alive.
+
+    Returns the socket status. Use this before running commands to verify
+    the pre-authenticated session is still active.
+
+    Args:
+        host: SSH config alias or hostname.
+    """
+    _validate_host(host)
+    return _run(["ssh", "-O", "check", host])
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
