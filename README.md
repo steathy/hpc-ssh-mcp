@@ -38,8 +38,8 @@ Add to your MCP config (e.g. `claude_desktop_config.json`):
 {
   "mcpServers": {
     "ssh-hpc": {
-      "command": "uv",
-      "args": ["run", "--from", "git+https://github.com/steathy/hpc-ssh-mcp.git", "hpc-ssh-mcp"]
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/steathy/hpc-ssh-mcp.git", "hpc-ssh-mcp"]
     }
   }
 }
