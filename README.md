@@ -15,6 +15,10 @@ Uses native `ssh`/`scp` binaries via `subprocess` to respect `~/.ssh/config` and
 ## Install
 
 ```bash
+# Via uv (recommended)
+uv pip install git+https://github.com/steathy/hpc-ssh-mcp.git
+
+# Or clone and install locally
 git clone git@github.com:steathy/hpc-ssh-mcp.git
 cd hpc-ssh-mcp
 uv pip install -e .
