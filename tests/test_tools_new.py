@@ -123,3 +123,34 @@ class TestTailRemoteFile:
         from ssh_hpc_server import tail_remote_file
         with pytest.raises(ValueError):
             tail_remote_file(host="bad; host", remote_path="/tmp/x")
+
+
+class TestCancelSlurmJob:
+    def test_calls_scancel(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        from ssh_hpc_server import cancel_slurm_job
+        result = cancel_slurm_job(host="derecho", job_id="12345")
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[0] == "ssh"
+        assert "scancel" in cmd[2]
+        assert "'12345'" in cmd[2]
+
+    def test_reports_cancel_failure(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=1, stderr="Invalid job id\n",
+        )
+        from ssh_hpc_server import cancel_slurm_job
+        result = cancel_slurm_job(host="derecho", job_id="99999")
+        assert "[EXIT CODE 1]" in result
+
+    def test_rejects_invalid_job_id(self):
+        from ssh_hpc_server import cancel_slurm_job
+        with pytest.raises(ValueError, match="Invalid Slurm job ID"):
+            cancel_slurm_job(host="derecho", job_id="12345; rm -rf /")
+
+    def test_accepts_array_job_id(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        from ssh_hpc_server import cancel_slurm_job
+        cancel_slurm_job(host="derecho", job_id="12345_0")
+        cmd = mock_subprocess.call_args[0][0][2]
+        assert "12345_0" in cmd
