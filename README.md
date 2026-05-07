@@ -44,9 +44,21 @@ Add to your MCP config (e.g. `claude_desktop_config.json`):
 | `execute_remote_bash` | Run any bash command on a remote host |
 | `submit_slurm_job` | Write a Slurm batch script and submit via `sbatch` |
 | `check_slurm_job` | Query job status via `squeue` + `sacct` |
+| `cancel_slurm_job` | Cancel a Slurm job via `scancel` |
+| `list_slurm_queue` | List jobs in the Slurm queue (`squeue -u $USER`) |
 | `read_remote_file` | Read a remote text file into context |
+| `tail_remote_file` | Read last N lines of a remote file |
 | `scp_download_file` | Download a file via `scp` |
+| `scp_upload_file` | Upload a file via `scp` |
+| `check_ssh_connection` | Verify ControlMaster socket is alive |
+
+## Testing
+
+```bash
+uv pip install -e ".[dev]"
+uv run pytest tests/ -v
+```
 
 ## Version
 
-0.1.0
+0.2.0
