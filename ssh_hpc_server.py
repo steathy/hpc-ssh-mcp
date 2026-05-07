@@ -201,7 +201,7 @@ def cancel_slurm_job(host: str, job_id: str) -> str:
             f"Invalid Slurm job ID: {job_id!r}. "
             "Expected numeric ID, optionally with _ or . separators for array/step jobs."
         )
-    safe_id = f"'{job_id}'"
+    safe_id = shlex.quote(job_id)
     return _run(["ssh", host, f"scancel {safe_id}"])
 
 
