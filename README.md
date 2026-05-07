@@ -1,5 +1,7 @@
 # hpc-ssh-mcp
 
+[![GitHub](https://img.shields.io/github/v/tag/steathy/hpc-ssh-mcp)](https://github.com/steathy/hpc-ssh-mcp)
+
 MCP server for remote execution on SSH-enabled servers and supercomputers (e.g. NCAR Derecho).
 
 Uses native `ssh`/`scp` binaries via `subprocess` to respect `~/.ssh/config` and `ControlMaster` multiplex sockets — no Duo MFA re-prompts.
@@ -13,6 +15,8 @@ Uses native `ssh`/`scp` binaries via `subprocess` to respect `~/.ssh/config` and
 ## Install
 
 ```bash
+git clone git@github.com:steathy/hpc-ssh-mcp.git
+cd hpc-ssh-mcp
 uv pip install -e .
 ```
 
