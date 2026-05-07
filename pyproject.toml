@@ -1,0 +1,12 @@
+[project]
+name = "hpc-ssh-mcp"
+version = "0.1.0"
+description = "SSH & HPC Remote Control MCP Server — universal bridge to SSH-enabled servers and supercomputers"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
