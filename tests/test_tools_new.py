@@ -92,3 +92,34 @@ class TestListSlurmQueue:
         from ssh_hpc_server import list_slurm_queue
         with pytest.raises(ValueError):
             list_slurm_queue(host="bad; host")
+
+
+class TestTailRemoteFile:
+    def test_tails_with_default_lines(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=0, stdout="last line\n",
+        )
+        from ssh_hpc_server import tail_remote_file
+        result = tail_remote_file(host="derecho", remote_path="/tmp/job.out")
+        assert "last line" in result
+        cmd = mock_subprocess.call_args[0][0][2]
+        assert "tail -n 50" in cmd
+
+    def test_tails_with_custom_lines(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
+        from ssh_hpc_server import tail_remote_file
+        tail_remote_file(host="derecho", remote_path="/tmp/x", lines=200)
+        cmd = mock_subprocess.call_args[0][0][2]
+        assert "tail -n 200" in cmd
+
+    def test_quotes_remote_path(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
+        from ssh_hpc_server import tail_remote_file
+        tail_remote_file(host="derecho", remote_path="/path with spaces/out.log")
+        cmd = mock_subprocess.call_args[0][0][2]
+        assert "'" in cmd  # shlex.quote wraps in single quotes
+
+    def test_rejects_invalid_host(self):
+        from ssh_hpc_server import tail_remote_file
+        with pytest.raises(ValueError):
+            tail_remote_file(host="bad; host", remote_path="/tmp/x")

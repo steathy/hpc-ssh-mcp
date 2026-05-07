@@ -215,6 +215,27 @@ def read_remote_file(
 
 
 @mcp.tool()
+def tail_remote_file(
+    host: str,
+    remote_path: str,
+    lines: int = 50,
+) -> str:
+    """Read the last N lines of a text file on a remote host.
+
+    Ideal for checking the latest output from a running or completed Slurm job
+    without reading the entire file.
+
+    Args:
+        host: SSH config alias or hostname.
+        remote_path: Absolute or relative path to the file on the remote host.
+        lines: Number of lines to read from the end (default 50).
+    """
+    _validate_host(host)
+    safe_path = shlex.quote(remote_path)
+    return _run(["ssh", host, f"tail -n {int(lines)} {safe_path}"])
+
+
+@mcp.tool()
 def scp_download_file(
     host: str,
     remote_path: str,
