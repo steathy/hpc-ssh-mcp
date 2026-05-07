@@ -39,7 +39,7 @@ Add to your MCP config (e.g. `claude_desktop_config.json`):
   "mcpServers": {
     "ssh-hpc": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/hpc-ssh-mcp", "ssh_hpc_server.py"]
+      "args": ["run", "--from", "git+https://github.com/steathy/hpc-ssh-mcp.git", "hpc-ssh-mcp"]
     }
   }
 }
