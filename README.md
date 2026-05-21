@@ -69,4 +69,16 @@ uv run pytest tests/ -v
 
 ## Version
 
-0.3.0
+1.0.0
+
+## Changelog
+
+### 1.0.0
+
+- **Batch-safe SSH defaults.** Every `ssh` and `scp` invocation now carries `-o BatchMode=yes -o ConnectTimeout=10`. Without these, a dead `ControlMaster` socket caused SSH to fall back to interactive auth — and because MCP servers have no controlling terminal, the process would either hang on the JSON-RPC stream until the 120 s timeout or fail with a cryptic message. With them, the failure is bounded to ≤ 10 s and surfaces a parseable error.
+- **Actionable failure diagnostics.** SSH/SCP failures are now fingerprinted (`Permission denied (...keyboard-interactive...)`, `Control socket connect: No such file`, `Connection timed out`, `No route to host`) and rewritten with a hint telling the user exactly what to do — typically `ssh -fN <host>` from their terminal to re-establish the multiplex socket and complete Duo/MFA out-of-band.
+- **`check_ssh_connection` is unchanged.** `ssh -O check` is a local socket query, not a connection, so it intentionally does not carry the new options.
+
+### 0.3.0
+
+- Initial public baseline: 10 MCP tools wrapping native `ssh` / `scp` / `sbatch` / `squeue` / `sacct` / `scancel`, leaning on `~/.ssh/config` + `ControlMaster` for credential reuse.

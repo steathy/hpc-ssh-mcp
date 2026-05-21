@@ -42,8 +42,9 @@ class TestScpUploadFile:
         )
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "scp"
-        assert cmd[1] == "C:/Users/me/input.nc"
-        assert "derecho:" in cmd[2]
+        # local source and remote dest are always the last two argv elements
+        assert cmd[-2] == "C:/Users/me/input.nc"
+        assert "derecho:" in cmd[-1]
 
     def test_reports_upload_failure(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(
@@ -70,14 +71,14 @@ class TestListSlurmQueue:
         from ssh_hpc_server import list_slurm_queue
         result = list_slurm_queue(host="derecho")
         assert "12345" in result
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "squeue" in cmd
 
     def test_filters_by_user(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="header\n")
         from ssh_hpc_server import list_slurm_queue
         list_slurm_queue(host="derecho", user="jsmith")
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "-u" in cmd
         assert "jsmith" in cmd
 
@@ -85,7 +86,7 @@ class TestListSlurmQueue:
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="header\n")
         from ssh_hpc_server import list_slurm_queue
         list_slurm_queue(host="derecho")
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "$USER" in cmd
 
     def test_rejects_invalid_host(self):
@@ -102,21 +103,21 @@ class TestTailRemoteFile:
         from ssh_hpc_server import tail_remote_file
         result = tail_remote_file(host="derecho", remote_path="/tmp/job.out")
         assert "last line" in result
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "tail -n 50" in cmd
 
     def test_tails_with_custom_lines(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
         from ssh_hpc_server import tail_remote_file
         tail_remote_file(host="derecho", remote_path="/tmp/x", lines=200)
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "tail -n 200" in cmd
 
     def test_quotes_remote_path(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
         from ssh_hpc_server import tail_remote_file
         tail_remote_file(host="derecho", remote_path="/path with spaces/out.log")
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "'" in cmd  # shlex.quote wraps in single quotes
 
     def test_rejects_invalid_host(self):
@@ -132,8 +133,8 @@ class TestCancelSlurmJob:
         result = cancel_slurm_job(host="derecho", job_id="12345")
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "ssh"
-        assert "scancel" in cmd[2]
-        assert "12345" in cmd[2]
+        assert "scancel" in cmd[-1]
+        assert "12345" in cmd[-1]
 
     def test_reports_cancel_failure(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(
@@ -152,5 +153,5 @@ class TestCancelSlurmJob:
         mock_subprocess.return_value = make_completed_process(returncode=0)
         from ssh_hpc_server import cancel_slurm_job
         cancel_slurm_job(host="derecho", job_id="12345_0")
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "12345_0" in cmd

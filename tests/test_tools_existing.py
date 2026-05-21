@@ -23,8 +23,8 @@ class TestExecuteRemoteBash:
         mock_subprocess.assert_called_once()
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "ssh"
-        assert cmd[1] == "derecho"
-        assert "bash -c" in cmd[2]
+        assert "derecho" in cmd
+        assert "bash -c" in cmd[-1]
 
     def test_rejects_invalid_host(self):
         with pytest.raises(ValueError):
@@ -58,10 +58,10 @@ class TestSubmitSlurmJob:
         )
         assert "12345" in result
         assert mock_subprocess.call_count == 2
-        write_call = mock_subprocess.call_args_list[0]
-        assert "cat >" in write_call[0][0][2]
-        submit_call = mock_subprocess.call_args_list[1]
-        assert "sbatch" in submit_call[0][0][2]
+        write_cmd = mock_subprocess.call_args_list[0][0][0]
+        assert "cat >" in write_cmd[-1]
+        submit_cmd = mock_subprocess.call_args_list[1][0][0]
+        assert "sbatch" in submit_cmd[-1]
 
     def test_reports_write_failure(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(
@@ -91,7 +91,7 @@ class TestSubmitSlurmJob:
             job_script_content="#!/bin/bash",
             remote_filename="my script.sh",
         )
-        write_cmd = mock_subprocess.call_args_list[0][0][0][2]
+        write_cmd = mock_subprocess.call_args_list[0][0][0][-1]
         assert "'" in write_cmd
 
 
@@ -101,7 +101,7 @@ class TestSubmitSlurmJob:
             make_completed_process(returncode=0, stdout="Submitted batch job 1\n"),
         ]
         submit_slurm_job(host="derecho", job_script_content="#!/bin/bash")
-        write_cmd = mock_subprocess.call_args_list[0][0][0][2]
+        write_cmd = mock_subprocess.call_args_list[0][0][0][-1]
         assert "claude_job_" in write_cmd
         assert ".sh" in write_cmd
 
@@ -115,14 +115,14 @@ class TestSubmitSlurmJob:
             make_completed_process(returncode=0, stdout="Submitted batch job 1\n"),
         ]
         submit_slurm_job(host="derecho", job_script_content="#!/bin/bash", remote_filename="job.sh")
-        submit_cmd = mock_subprocess.call_args_list[1][0][0][2]
+        submit_cmd = mock_subprocess.call_args_list[1][0][0][-1]
         assert "sbatch --" in submit_cmd
 
     def test_wraps_command_in_bash(self, mock_subprocess):
         """execute_remote_bash should force bash regardless of login shell."""
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
         execute_remote_bash(host="derecho", command="echo hello")
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert cmd.startswith("bash -c ")
 
 
@@ -162,20 +162,20 @@ class TestReadRemoteFile:
         assert "line1" in result
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "ssh"
-        assert "cat" in cmd[2]
+        assert "cat" in cmd[-1]
 
     def test_uses_head_when_max_lines_set(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(
             returncode=0, stdout="line1\n",
         )
         read_remote_file(host="derecho", remote_path="/tmp/big.log", max_lines=100)
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "head -n 100" in cmd
 
     def test_quotes_remote_path(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
         read_remote_file(host="derecho", remote_path="/path with spaces/file.txt")
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "'" in cmd
 
 
@@ -189,8 +189,9 @@ class TestScpDownloadFile:
         )
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "scp"
-        assert "derecho:" in cmd[1]
-        assert cmd[2] == "C:/Users/me/output.nc"
+        # source (remote) and dest (local) are always the last two argv elements
+        assert "derecho:" in cmd[-2]
+        assert cmd[-1] == "C:/Users/me/output.nc"
 
     def test_reports_scp_failure(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(

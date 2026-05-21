@@ -73,7 +73,7 @@ class TestLeadingDashFilenameRejection:
         ]
         from ssh_hpc_server import submit_slurm_job
         submit_slurm_job(host="derecho", job_script_content="#!/bin/bash", remote_filename="safe.sh")
-        sbatch_cmd = mock_subprocess.call_args_list[1][0][0][2]
+        sbatch_cmd = mock_subprocess.call_args_list[1][0][0][-1]
         assert "sbatch -- " in sbatch_cmd
 
     def test_submit_slurm_job_uses_double_dash_for_chmod(self, mock_subprocess):
@@ -84,7 +84,7 @@ class TestLeadingDashFilenameRejection:
         ]
         from ssh_hpc_server import submit_slurm_job
         submit_slurm_job(host="derecho", job_script_content="#!/bin/bash", remote_filename="safe.sh")
-        chmod_cmd = mock_subprocess.call_args_list[0][0][0][2]
+        chmod_cmd = mock_subprocess.call_args_list[0][0][0][-1]
         assert "chmod -- " in chmod_cmd
 
 
@@ -175,15 +175,15 @@ class TestBashExecution:
         execute_remote_bash(host="derecho", command="echo $SHELL")
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "ssh"
-        assert cmd[1] == "derecho"
-        assert cmd[2].startswith("bash -c ")
+        assert "derecho" in cmd
+        assert cmd[-1].startswith("bash -c ")
 
     def test_command_with_quotes_properly_escaped(self, mock_subprocess):
         """Commands containing quotes must survive the bash -c + shlex.quote wrapping."""
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
         from ssh_hpc_server import execute_remote_bash
         execute_remote_bash(host="derecho", command="echo 'hello world'")
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "bash -c " in cmd
         assert "hello world" in cmd
 
@@ -192,7 +192,7 @@ class TestBashExecution:
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
         from ssh_hpc_server import execute_remote_bash
         execute_remote_bash(host="derecho", command="ls | grep foo")
-        cmd = mock_subprocess.call_args[0][0][2]
+        cmd = mock_subprocess.call_args[0][0][-1]
         assert "bash -c " in cmd
         assert "ls | grep foo" in cmd
 

@@ -14,11 +14,21 @@ import uuid
 
 from fastmcp import FastMCP
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
 DEFAULT_TIMEOUT = 120
+
+# Applied to every ssh/scp invocation that actually opens a connection.
+# BatchMode=yes:    refuse interactive auth (password, keyboard-interactive/MFA);
+#                   MCP servers have no TTY, so interactive auth would otherwise
+#                   either hang reading the JSON-RPC stream or fail cryptically
+#                   120s later.
+# ConnectTimeout=10: bound the TCP handshake so an unreachable host fails fast
+#                   instead of riding the OS default (~75-120s).
+SSH_OPTS: tuple[str, ...] = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
+
 _VALID_HOST_RE = re.compile(r"^[a-zA-Z0-9._@-]+$")
 _VALID_JOB_ID_RE = re.compile(r"^\d+([_.]\d+)*$")
 _VALID_USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
@@ -86,6 +96,84 @@ def _run(
     return _format_result(rc, out, err)
 
 
+def _ssh_cmd(host: str, remote_cmd: str) -> list[str]:
+    """Build an ssh argv with batch-safe defaults (see SSH_OPTS)."""
+    return ["ssh", *SSH_OPTS, host, remote_cmd]
+
+
+def _scp_cmd(*scp_args: str) -> list[str]:
+    """Build an scp argv with batch-safe defaults (see SSH_OPTS)."""
+    return ["scp", *SSH_OPTS, *scp_args]
+
+
+def _diagnose_ssh_failure(host: str, stderr: str) -> str:
+    """Map known SSH failure patterns to an actionable hint, or empty string.
+
+    OpenSSH does not surface a structured 'ControlMaster expired' signal, so we
+    fingerprint stderr. Patterns cover the three common shapes:
+      - auth fell back to interactive (Duo would be needed) → re-establish master
+      - control socket file is gone                         → re-establish master
+      - network unreachable                                 → check connectivity
+    """
+    s = stderr.lower()
+    reauth = f"From your terminal (where Duo/MFA prompts can be answered), run:\n    ssh -fN {host}"
+
+    if "permission denied" in s and ("keyboard-interactive" in s or "publickey" in s):
+        return (
+            f"\n\nHint: SSH auth failed for {host!r}. The ControlMaster socket has likely "
+            f"expired, so a new connection was attempted and rejected because this server "
+            f"cannot answer interactive MFA prompts.\n{reauth}\nThen retry."
+        )
+    if "control socket connect" in s or ("control path" in s and "no such file" in s):
+        return (
+            f"\n\nHint: ControlMaster socket for {host!r} is missing.\n{reauth}"
+        )
+    if (
+        "operation timed out" in s
+        or "connection timed out" in s
+        or "no route to host" in s
+        or "network is unreachable" in s
+    ):
+        return (
+            f"\n\nHint: Network unreachable to {host!r}. Check VPN/connectivity, then:\n"
+            f"    ssh -fN {host}"
+        )
+    return ""
+
+
+def _run_ssh(
+    host: str,
+    remote_cmd: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    input_data: str | None = None,
+) -> str:
+    """Run a remote command over ssh and append a diagnostic hint on failure."""
+    rc, out, err = _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
+    formatted = _format_result(rc, out, err)
+    if rc != 0:
+        formatted += _diagnose_ssh_failure(host, err)
+    return formatted
+
+
+def _run_ssh_raw(
+    host: str,
+    remote_cmd: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    input_data: str | None = None,
+) -> tuple[int, str, str]:
+    """Like _run_ssh, but returns the raw (rc, stdout, stderr) for callers that branch on rc."""
+    return _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
+
+
+def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_TIMEOUT) -> str:
+    """Run scp and append a diagnostic hint on failure (host used only for the hint)."""
+    rc, out, err = _run_raw(_scp_cmd(*scp_args), timeout=timeout)
+    formatted = _format_result(rc, out, err)
+    if rc != 0:
+        formatted += _diagnose_ssh_failure(host, err)
+    return formatted
+
+
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
@@ -107,7 +195,7 @@ def execute_remote_bash(
         timeout: Max seconds to wait (default 120).
     """
     _validate_host(host)
-    return _run(["ssh", host, f"bash -c {shlex.quote(command)}"], timeout=timeout)
+    return _run_ssh(host, f"bash -c {shlex.quote(command)}", timeout=timeout)
 
 
 @mcp.tool()
@@ -133,14 +221,16 @@ def submit_slurm_job(
         raise ValueError(f"remote_filename must not start with '-': {remote_filename!r}")
     safe_fn = shlex.quote(remote_filename)
 
-    rc, out, err = _run_raw(
-        ["ssh", host, f"cat > {safe_fn} && chmod -- +x {safe_fn}"],
+    rc, out, err = _run_ssh_raw(
+        host,
+        f"cat > {safe_fn} && chmod -- +x {safe_fn}",
         input_data=job_script_content,
     )
     if rc != 0:
-        return f"Failed to write script to {remote_filename}:\n{_format_result(rc, out, err)}"
+        msg = f"Failed to write script to {remote_filename}:\n{_format_result(rc, out, err)}"
+        return msg + _diagnose_ssh_failure(host, err)
 
-    return _run(["ssh", host, f"sbatch -- {safe_fn}"])
+    return _run_ssh(host, f"sbatch -- {safe_fn}")
 
 
 @mcp.tool()
@@ -163,14 +253,14 @@ def check_slurm_job(host: str, job_id: str) -> str:
 
     safe_id = shlex.quote(job_id)
 
-    squeue_result = _run([
-        "ssh", host,
+    squeue_result = _run_ssh(
+        host,
         f"squeue -j {safe_id} --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R' 2>/dev/null",
-    ])
-    sacct_result = _run([
-        "ssh", host,
+    )
+    sacct_result = _run_ssh(
+        host,
         f"sacct -j {safe_id} --format=JobID,JobName,Partition,State,ExitCode,Elapsed,Start,End --parsable2",
-    ])
+    )
 
     return (
         f"=== squeue (running/pending) ===\n{squeue_result}\n\n"
@@ -196,7 +286,7 @@ def list_slurm_queue(host: str, user: str = "") -> str:
         cmd = f"squeue -u {safe_user} --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R'"
     else:
         cmd = "squeue -u $USER --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R'"
-    return _run(["ssh", host, cmd])
+    return _run_ssh(host, cmd)
 
 
 @mcp.tool()
@@ -214,7 +304,7 @@ def cancel_slurm_job(host: str, job_id: str) -> str:
             "Expected numeric ID, optionally with _ or . separators for array/step jobs."
         )
     safe_id = shlex.quote(job_id)
-    return _run(["ssh", host, f"scancel {safe_id}"])
+    return _run_ssh(host, f"scancel {safe_id}")
 
 
 @mcp.tool()
@@ -241,7 +331,7 @@ def read_remote_file(
     else:
         cmd = f"cat {safe_path}"
 
-    return _run(["ssh", host, cmd])
+    return _run_ssh(host, cmd)
 
 
 @mcp.tool()
@@ -264,7 +354,7 @@ def tail_remote_file(
     if lines < 1:
         raise ValueError(f"lines must be >= 1, got {lines}")
     safe_path = shlex.quote(remote_path)
-    return _run(["ssh", host, f"tail -n {int(lines)} {safe_path}"])
+    return _run_ssh(host, f"tail -n {int(lines)} {safe_path}")
 
 
 @mcp.tool()
@@ -286,7 +376,7 @@ def scp_download_file(
     _validate_host(host)
     # shlex.quote the remote path for the remote shell that scp invokes
     escaped_remote = shlex.quote(remote_path)
-    return _run(["scp", f"{host}:{escaped_remote}", local_path])
+    return _run_scp(host, [f"{host}:{escaped_remote}", local_path])
 
 
 @mcp.tool()
@@ -306,7 +396,7 @@ def scp_upload_file(
     """
     _validate_host(host)
     escaped_remote = shlex.quote(remote_path)
-    return _run(["scp", local_path, f"{host}:{escaped_remote}"])
+    return _run_scp(host, [local_path, f"{host}:{escaped_remote}"])
 
 
 @mcp.tool()
