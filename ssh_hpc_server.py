@@ -1782,6 +1782,9 @@ def globus_find_collection(query: str) -> str:
     """
     if not _globus_cli_available():
         return _globus_unavailable()
+    # A positional for the CLI: like a host alias, it must not read as an option.
+    if not query.strip() or query.lstrip().startswith("-"):
+        raise ValueError(f"Invalid query: {query!r}. Give part of a collection name; it must not start with '-'.")
     data, err = _globus_json(["endpoint", "search", query])
     if err:
         return err

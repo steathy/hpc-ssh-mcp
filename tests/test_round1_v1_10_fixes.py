@@ -559,3 +559,29 @@ class TestOnboardingNoticePlacement:
     def test_command_tools_carry_it_on_first_use(self, mock_subprocess, call):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
         assert "[first use of 'newbox'" in call()
+
+
+# ---------------------------------------------------------------------------
+# F17: every user-controlled string that reaches a subprocess argument is validated
+# ---------------------------------------------------------------------------
+# globus_find_collection passed `query` as a positional. A leading '-' was parsed by
+# the CLI as an option ("No such option '-x'"). Harmless, but the one argument in
+# the file the rule from AGENTS.md was not applied to.
+
+class TestCollectionQueryIsValidated:
+    def test_a_leading_dash_is_refused_before_the_cli_runs(self, mock_subprocess, monkeypatch):
+        monkeypatch.setattr(ssh_hpc_server.shutil, "which", lambda name: "/usr/bin/globus")
+        with pytest.raises(ValueError, match="query"):
+            ssh_hpc_server.globus_find_collection("-x")
+        mock_subprocess.assert_not_called()
+
+    def test_an_empty_query_is_refused(self, mock_subprocess, monkeypatch):
+        monkeypatch.setattr(ssh_hpc_server.shutil, "which", lambda name: "/usr/bin/globus")
+        with pytest.raises(ValueError, match="query"):
+            ssh_hpc_server.globus_find_collection("   ")
+        mock_subprocess.assert_not_called()
+
+    def test_an_inner_dash_is_fine(self, mock_subprocess, monkeypatch):
+        monkeypatch.setattr(ssh_hpc_server.shutil, "which", lambda name: "/usr/bin/globus")
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="[]")
+        assert "No collection matched" in ssh_hpc_server.globus_find_collection("NCAR-GLADE")
