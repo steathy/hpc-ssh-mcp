@@ -1224,17 +1224,53 @@ def _validate_task_id(task_id: str) -> str:
     return task_id.lower()
 
 
+def _globus_error(stderr: str) -> dict:
+    """Parse the JSON error body the CLI prints on stderr, or {}."""
+    text = (stderr or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return {}
+    try:
+        parsed = json.loads(text[start:])
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _consent_hint(stderr: str) -> str:
+    """A ConsentRequired error carries the exact scopes to consent to.
+
+    Globus reports this with exit code 1, not the auth exit code, so it must be
+    checked on every failure. The scopes come from the error body verbatim: a
+    scope rebuilt from the collection UUID can be wrong when the collection
+    depends on another one.
+    """
+    body = _globus_error(stderr)
+    is_consent = (
+        str(body.get("code", "")).lower() == "consentrequired"
+        or "consentrequired" in (stderr or "").lower().replace(" ", "")
+    )
+    if not is_consent:
+        return ""
+    scopes = body.get("required_scopes") or body.get(
+        "authorization_parameters", {}).get("required_scopes") or []
+    if not scopes:
+        m = re.search(r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", stderr or "")
+        if not m:
+            return ""
+        scopes = [_CONSENT_SCOPE.format(uuid=m.group(1).lower())]
+    commands = "\n".join(f"    globus session consent '{sc}'" for sc in scopes)
+    message = body.get("message") or "Missing required data_access consent"
+    return (
+        f"\n\nHint: {message}. This collection needs a one-time data_access consent, "
+        "granted from your own terminal:\n"
+        f"{commands}\nThen retry."
+    )
+
+
 def _globus_auth_hint(stderr: str) -> str:
-    """Translate a CLI exit-4 into the command that fixes it."""
-    m = re.search(r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", stderr or "")
-    if "consentrequired" in (stderr or "").lower().replace(" ", "") and m:
-        scope = _CONSENT_SCOPE.format(uuid=m.group(1).lower())
-        return (
-            "\n\nHint: this collection needs a one-time data_access consent. "
-            "From your own terminal, run:\n"
-            f"    globus session consent '{scope}'\nThen retry."
-        )
-    return f"\n\nHint: {_LOGIN_STEPS}\nThen retry."
+    """Translate a CLI auth failure into the command that fixes it."""
+    return _consent_hint(stderr) or f"\n\nHint: {_LOGIN_STEPS}\nThen retry."
 
 
 def _run_globus(args: list[str], timeout: int = DEFAULT_GLOBUS_TIMEOUT) -> tuple[int, str, str]:
@@ -1249,9 +1285,12 @@ def _globus_json(args: list[str], timeout: int = DEFAULT_GLOBUS_TIMEOUT):
     """
     rc, out, err = _run_globus([*args, "--format", "json"], timeout=timeout)
     if rc != 0:
-        msg = _format_result(rc, out, err)
-        if rc == GLOBUS_EXIT_AUTH:
-            msg += _globus_auth_hint(err)
+        body = _globus_error(err)
+        # The raw JSON body is noise for a model; lead with what went wrong.
+        summary = f"{body.get('code')}: {body.get('message')}" if body.get("code") else None
+        msg = summary or _format_result(rc, out, err)
+        # ConsentRequired arrives on exit 1, so check it before the exit code.
+        msg += _consent_hint(err) or (_globus_auth_hint(err) if rc == GLOBUS_EXIT_AUTH else "")
         return None, msg
     try:
         return json.loads(out or "null"), None

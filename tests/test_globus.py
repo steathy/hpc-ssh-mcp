@@ -312,3 +312,70 @@ class TestGlobusAnnotations:
         for name in ("globus_transfer", "globus_task_cancel"):
             assert tools[name].annotations.readOnlyHint is False, name
         assert tools["globus_task_cancel"].annotations.destructiveHint is True
+
+
+# ---------------------------------------------------------------------------
+# ConsentRequired arrives with exit code 1 and a JSON body, not exit 4.
+# Found by running globus_ls against NCAR GLADE from a logged-in machine.
+# ---------------------------------------------------------------------------
+
+CONSENT_SCOPE = (
+    "urn:globus:auth:scope:transfer.api.globus.org:all"
+    f"[*https://auth.globus.org/scopes/{GLADE}/data_access]"
+)
+CONSENT_BODY = json.dumps({
+    "authorization_parameters": {
+        "required_scopes": [CONSENT_SCOPE],
+        "session_message": "Missing required data_access consent",
+    },
+    "code": "ConsentRequired",
+    "message": "Missing required data_access consent",
+    "required_scopes": [CONSENT_SCOPE],
+    "resource": f"/operation/endpoint/{GLADE}/ls",
+})
+
+
+class TestConsentRequiredOnExitOne:
+    def test_ls_consent_error_gets_the_consent_command(self, have_cli, profiles, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=1, stderr=CONSENT_BODY)
+        result = globus_ls("glade", "/")
+        assert "globus session consent" in result
+        assert CONSENT_SCOPE in result
+
+    def test_scope_is_taken_verbatim_from_the_error_body(self, have_cli, profiles, mock_subprocess):
+        """Globus tells us the exact scopes; do not rebuild them from the UUID."""
+        other = "urn:globus:auth:scope:transfer.api.globus.org:all[*https://auth.globus.org/scopes/xyz/data_access]"
+        body = json.dumps({"code": "ConsentRequired", "required_scopes": [other]})
+        mock_subprocess.return_value = make_completed_process(returncode=1, stderr=body)
+        assert other in globus_ls("glade", "/")
+
+    def test_multiple_required_scopes_are_all_listed(self, have_cli, profiles, mock_subprocess):
+        a = "urn:globus:auth:scope:transfer.api.globus.org:all[*https://auth.globus.org/scopes/aaa/data_access]"
+        b = "urn:globus:auth:scope:transfer.api.globus.org:all[*https://auth.globus.org/scopes/bbb/data_access]"
+        body = json.dumps({"code": "ConsentRequired", "required_scopes": [a, b]})
+        mock_subprocess.return_value = make_completed_process(returncode=1, stderr=body)
+        result = globus_ls("glade", "/")
+        assert a in result and b in result
+
+    def test_transfer_consent_error_also_gets_the_hint(self, have_cli, profiles, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=1, stderr=CONSENT_BODY)
+        result = globus_transfer(source="glade", source_path="/a", dest="alpine", dest_path="/b")
+        assert "globus session consent" in result
+
+    def test_ordinary_error_gets_no_consent_hint(self, have_cli, profiles, mock_subprocess):
+        body = json.dumps({"code": "ClientError.NotFound", "message": "No task found"})
+        mock_subprocess.return_value = make_completed_process(returncode=1, stderr=body)
+        result = globus_task_status("1234abcd-0000-0000-0000-00000000cafe")
+        assert "session consent" not in result
+        assert "No task found" in result
+
+    def test_error_message_is_surfaced_not_just_the_raw_json(self, have_cli, profiles, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=1, stderr=CONSENT_BODY)
+        assert "Missing required data_access consent" in globus_ls("glade", "/")
+
+    def test_exit_four_still_gets_the_login_hint(self, have_cli, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=4, stderr="MissingLoginError: Missing login for Globus Auth.\n",
+        )
+        result = globus_status()
+        assert "globus login" in result
