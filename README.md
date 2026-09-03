@@ -406,9 +406,24 @@ The unit suite mocks `subprocess.run`. The live suite exists because several rea
 
 ## Version
 
-1.10.0
+1.11.0
 
 ## Changelog
+
+### 1.11.0
+
+Fixes from a review of 1.10.0. No new tools, settings or tiers: every change narrows a rule, removes state, or corrects a message.
+
+- **Four block-tier false positives are gone.** `ls -ltr <shared root>` was refused as a recursive traversal; for `ls`, `-r` is reverse sort and only `-R` recurses. `rpm -qa`, `dnf list installed` and `apt list --installed` were refused as package-manager use; the rule now names the mutating verbs only. `dd … of=/dev/null` was refused as a device write; `/dev/null` and the standard streams are excluded.
+- **Editing `hosts.json` takes effect at once.** Every refusal tells you to edit the settings file and retry, but the file was read once per session, so the retry got the same refusal until a restart. It is read on every call now.
+- **`probe_host` suggests a real scratch path.** It proposed `/glade/derecho/scratch/$USER`, which `submit_job` shell-quotes, so the value named a directory literally called `$USER`. The probe reports the username and the suggestion is concrete.
+- **`read_remote_file` returns the file.** A non-UTF-8 file read in full was reported truncated and cut short; a read above the 200 KB cap bypassed the cap; the login shell's stderr was appended to the content; a whitespace-only file read as `(no output)`. The remote now reports the byte count, and the tool returns what it sent, capped. The notice reads "truncated at N of M bytes".
+- **The "remote command was NOT stopped" note is attached only to remote commands.** It was printed for scp, Globus and `run_on_compute` timeouts, where it was wrong or incomplete; `run_on_compute` now also points at `list_queue` and `cancel_job`.
+- **`record_host(host, is_hpc=True)` undoes an earlier `is_hpc=False`.** `is_hpc` is a tri-state and omitting it leaves the setting alone. `record_host` also folds case (`role="Login"`), accepts a `scratch` path with a space or `#`, keeps a `globus` UUID on a non-HPC host, and rewrites the file it read rather than a filtered copy, so hand-written content it does not understand survives.
+- **scp results describe the file.** A failed upload no longer ends with "[N GB transferred over scp]"; any failed download removes a file that did not exist before, and says so when an existing file has been partially overwritten.
+- **Concurrent calls are safe.** Two `record_host` calls at once could lose one. A lock guards the store's read-merge-write and the poll cache's bookkeeping, and is never held across an SSH round trip.
+- **The sdist ships only the README, the server and the tests.** Working documents kept out of git through `.git/info/exclude` were being packaged.
+- Smaller: `locate` is not a traversal; `julia -e`, `perl -e` and `Rscript -e` one-liners are not "running a script"; the route refusal names a data-transfer node when it is on one; `rm -rf` and the traversal rule agree on the shared roots, so `/glade/derecho/scratch`, `/glade/u/home` and `/data` are protected from `rm -rf` too; the first-use notice is no longer replayed by cached scheduler queries or appended to `tail_remote_file` output; `globus_find_collection` rejects a query starting with `-`.
 
 ### 1.10.0
 

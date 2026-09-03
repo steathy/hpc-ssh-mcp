@@ -1,6 +1,6 @@
 [project]
 name = "hpc-ssh-mcp"
-version = "1.10.0"
+version = "1.11.0"
 description = "SSH & HPC Remote Control MCP Server — universal bridge to SSH-enabled servers and supercomputers"
 # README.md is the only documentation that ships, so it is also the long
 # description: without this the distributions carry a one-line summary and a
