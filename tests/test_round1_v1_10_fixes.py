@@ -223,3 +223,48 @@ class TestReadRemoteFileReturnsTheFile:
             returncode=1, stdout="", stderr="head: cannot open '/tmp/f' for reading: No such file or directory\n")
         result = ssh_hpc_server.read_remote_file(host="derecho", remote_path="/tmp/f")
         assert "[EXIT CODE 1]" in result and "No such file" in result
+
+
+# ---------------------------------------------------------------------------
+# F8: record_host can say "this is HPC after all"
+# ---------------------------------------------------------------------------
+# Round 1 of 1.8.0 (F4) made record_host merge rather than replace, so that a
+# partial update could not silently revert hpc=false. The other direction was
+# lost: is_hpc=True never wrote anything, so once a host was hpc=false no call
+# could undo it, and the reply for record_host(is_hpc=True, ...) said hpc=False.
+# is_hpc is a tri-state now: omitted leaves the key alone.
+
+class TestHpcFalseCanBeUndone:
+    def test_true_after_false_restores_the_policy(self, store):
+        ssh_hpc_server.record_host("box", is_hpc=False)
+        assert ssh_hpc_server._policy_mode("box") == "off"
+        ssh_hpc_server.record_host("box", is_hpc=True, center="curc", role="login")
+        assert ssh_hpc_server._is_hpc("box") is True
+        assert ssh_hpc_server._policy_mode("box") == "strict"
+
+    def test_the_reply_does_not_contradict_the_call(self, store):
+        ssh_hpc_server.record_host("box", is_hpc=False)
+        result = ssh_hpc_server.record_host("box", is_hpc=True, center="curc")
+        assert "hpc=False" not in result, result
+
+    def test_an_omitted_is_hpc_leaves_hpc_false_alone(self, store):
+        """The F4 property, restated for the tri-state."""
+        ssh_hpc_server.record_host("box", is_hpc=False)
+        ssh_hpc_server.record_host("box", account="UABC0001")
+        assert ssh_hpc_server._is_hpc("box") is False
+
+    def test_true_on_a_fresh_host_is_nothing_to_write(self, store):
+        result = ssh_hpc_server.record_host("box", is_hpc=True)
+        assert "nothing" in result.lower(), result
+        assert not store.exists()
+
+    def test_true_alone_on_a_non_hpc_host_is_a_real_write(self, store):
+        ssh_hpc_server.record_host("box", is_hpc=False)
+        result = ssh_hpc_server.record_host("box", is_hpc=True)
+        assert "nothing" not in result.lower(), result
+        assert ssh_hpc_server._is_hpc("box") is True
+        assert "hpc" not in json.loads(store.read_text())["hosts"]["box"]
+
+    def test_the_default_is_omitted(self):
+        import inspect
+        assert inspect.signature(ssh_hpc_server.record_host).parameters["is_hpc"].default is None

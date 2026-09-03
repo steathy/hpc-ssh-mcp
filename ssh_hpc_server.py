@@ -2110,7 +2110,7 @@ def _validate_setting(key: str, value: str) -> None:
 @mcp.tool(annotations=_ADDITIVE)
 def record_host(
     host: str,
-    is_hpc: bool = True,
+    is_hpc: bool | None = None,
     center: str = "",
     role: str = "",
     account: str = "",
@@ -2132,7 +2132,8 @@ def record_host(
         host: SSH alias, exactly as the user connects with it.
         is_hpc: False for a machine that is not a shared HPC system. Login-node
             etiquette and the command policy stop applying there, and the
-            HPC-only fields are ignored.
+            HPC-only fields are ignored. True says it is an HPC system after all,
+            undoing an earlier False. Omitted leaves whatever is recorded alone.
         center: 'ncar' or 'curc'. Selects PBS or Slurm without probing.
         role: 'login', 'data-access' or 'compute'.
         account: Project code to charge jobs to.
@@ -2153,7 +2154,7 @@ def record_host(
         if value:
             _validate_setting(key, str(value))
 
-    if not is_hpc:
+    if is_hpc is False:
         # Nothing about schedulers, accounts or filesystems applies off an HPC system.
         pairs = {"hpc": False}
         if policy:
@@ -2162,11 +2163,6 @@ def record_host(
         pairs = {k: v for k, v in values.items() if v}
         if role:
             pairs["role"] = _ROLE_ALIASES.get(role, role)
-    if not pairs:
-        return (
-            f"Nothing to write for {host!r}. Pass at least one of is_hpc=False, center, role, "
-            "account, scratch, globus or policy."
-        )
 
     entries, read_error = _read_store_file()
     if read_error:
@@ -2176,14 +2172,24 @@ def record_host(
             "Ask the user to fix or delete the file, then try again."
         )
     # Merge, rather than replace the host's entry. Replacing was the behaviour
-    # in every storage format this server has had, but `is_hpc: bool` cannot
-    # express "leave this alone", so a partial update -- the natural call once a
-    # host is already described -- asserted "this is an HPC system" and dropped
-    # a recorded `hpc=false` along with everything else it did not mention.
-    # Unsetting a key stays a hand-edit of the file, which _STORE_NOTE invites.
-    entries = dict(entries)
-    merged = dict(entries.get(host, {}))
+    # in every storage format this server has had, but a partial update -- the
+    # natural call once a host is already described -- must not drop what it
+    # does not mention. `is_hpc` is a tri-state for the same reason: True cannot
+    # be the default, or every partial update would assert "this is an HPC
+    # system" and revert a recorded hpc=false. An explicit True removes that key
+    # (HPC is the default reading); None leaves it alone. Unsetting anything
+    # else stays a hand-edit of the file, which _STORE_NOTE invites.
+    existing = entries.get(host, {})
+    merged = dict(existing)
     merged.update(pairs)
+    if is_hpc is True:
+        merged.pop("hpc", None)
+    if not pairs and merged == existing:
+        return (
+            f"Nothing to write for {host!r}. Pass at least one of is_hpc, center, role, "
+            "account, scratch, globus or policy."
+        )
+    entries = dict(entries)
     entries[host] = merged
     error = _write_store(entries)
     if error:
