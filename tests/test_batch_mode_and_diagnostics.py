@@ -119,9 +119,11 @@ class TestEveryToolUsesBatchSafeOpts:
         scp_download_file(host="derecho", remote_path="/r/x", local_path="/l/x")
         self._assert_opts_present(mock_subprocess.call_args[0][0])
 
-    def test_scp_upload(self, mock_subprocess):
+    def test_scp_upload(self, mock_subprocess, tmp_path):
+        src = tmp_path / "x"
+        src.write_text("payload")
         mock_subprocess.return_value = make_completed_process(returncode=0)
-        scp_upload_file(host="derecho", local_path="/l/x", remote_path="/r/x")
+        scp_upload_file(host="derecho", local_path=str(src), remote_path="/r/x")
         self._assert_opts_present(mock_subprocess.call_args[0][0])
 
 
@@ -234,6 +236,6 @@ class TestDiagnosticHintAppearsInToolOutput:
 # ---------------------------------------------------------------------------
 
 class TestVersion:
-    def test_version_is_1_1_0(self):
+    def test_version_is_1_2_0(self):
         import ssh_hpc_server
-        assert ssh_hpc_server.__version__ == "1.1.0"
+        assert ssh_hpc_server.__version__ == "1.2.0"

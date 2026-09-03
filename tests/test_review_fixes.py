@@ -140,8 +140,10 @@ class TestLocalPathSafety:
         assert cmd[-1].startswith("/")
         assert cmd[-1].endswith("/out:1.nc")
 
-    def test_dash_prefixed_local_upload_path_is_not_an_option(self, mock_subprocess):
+    def test_dash_prefixed_local_upload_path_is_not_an_option(self, mock_subprocess, tmp_path, monkeypatch):
         from ssh_hpc_server import scp_upload_file
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "-oProxyCommand=evil").write_text("payload")
         mock_subprocess.return_value = make_completed_process(returncode=0)
         scp_upload_file(host="derecho", local_path="-oProxyCommand=evil", remote_path="/r/x")
         cmd = mock_subprocess.call_args[0][0]

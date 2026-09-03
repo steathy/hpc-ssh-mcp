@@ -15,12 +15,14 @@ def mock_subprocess():
     import ssh_hpc_server
     ssh_hpc_server._SCP_SFTP_MODE = False
     ssh_hpc_server._SCHEDULER_CACHE.clear()
+    ssh_hpc_server._POLL_CACHE.clear()
     try:
         with patch("ssh_hpc_server.subprocess.run") as mock_run:
             yield mock_run
     finally:
         ssh_hpc_server._SCP_SFTP_MODE = None
         ssh_hpc_server._SCHEDULER_CACHE.clear()
+        ssh_hpc_server._POLL_CACHE.clear()
 
 
 def make_completed_process(returncode=0, stdout="", stderr=""):

@@ -8,7 +8,7 @@ Uses native `ssh`/`scp` binaries via `subprocess` to respect `~/.ssh/config` and
 
 ## Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 - OpenSSH client (`ssh`, `scp`). The scp protocol mode (SFTP on OpenSSH 9.0+, legacy below) is detected automatically.
 - An active SSH `ControlMaster` socket for your target host (configured in `~/.ssh/config`). Establish it from a terminal where you can answer Duo/MFA: `ssh -fN <alias>`.
@@ -70,11 +70,34 @@ The four job tools take `scheduler="auto"|"pbs"|"slurm"`. With `auto` the server
 
 `submit_job` accepts `remote_dir` so scripts are written to, and submitted from, a scratch or work directory (for example `/glade/derecho/scratch/<user>/run1` or `/scratch/alpine/<user>/run1`) instead of `$HOME`.
 
-### Login-node etiquette
+### Command policy
 
-Everything in `execute_remote_bash` runs on the node you SSH into, normally a login node. NCAR and CU Boulder both terminate processes there that use more than a few GB of memory, significant CPU time, or heavy I/O. Use `run_on_compute` for anything heavier than editing, small scripts, and job management, and poll `list_queue`/`check_job` sparingly.
+`execute_remote_bash` and `run_on_compute` sort every command into a tier before sending it, because NCAR and CU Boulder both terminate heavy login-node processes without notice and CURC states login nodes are "not intended for computational tasks of any kind".
+
+| Tier | Examples | What happens |
+|---|---|---|
+| **block** | `sudo`, `su`, `apt`/`yum`/`dnf`, `rm -rf` on `/`, `~`, `$HOME`, `/glade`, `/scratch`, `/pl`, `/projects`, fork bombs, `mkfs`, `dd of=/dev/…`, writes to `authorized_keys` | Refused. No override. |
+| **confirm** | `rm -r` elsewhere, `find -delete`, recursive `chmod`/`chown`, `git push --force`, `git reset --hard`, `git clean -fd`, `scancel -u`, `qdel $(qselect …)`, `truncate`, `shred`, `crontab`, `ssh-keygen`, redirects over `.nc`/`.h5` files | Refused unless called with `confirm_destructive=true`. Ask the user first. |
+| **route** | interpreters running a script, compilers and `make`, MPI launchers, NCO/CDO tools, `conda`/`pip install`, `tar`/`zip`, `rsync`, `jupyter`, `nohup` | On a login or data-access node, refused with a pointer to `run_on_compute`; `allow_on_login_node=true` overrides for genuinely small cases. |
+| **free** | `ls`, `cat`, `grep`, `qstat`, `squeue`, `module avail`, `python --version`, `git status` | Runs. |
+
+Scheduler queries (`list_queue`, `check_job`) are rate-limited to one identical query per host every 30 seconds; a repeat inside that window returns the cached answer. Transfers over 2 GB get a note pointing at Globus or a data-transfer node.
 
 Paths: absolute paths are safest. `~/x` is expanded to the remote home directory in every path argument.
+
+### Host profiles
+
+An optional TOML file tells the server what each host is, so it skips the scheduler probe, defaults the account, and applies the right policy role. Copy [`hosts.example.toml`](hosts.example.toml) to `~/.config/hpc-ssh-mcp/hosts.toml`, or point `$HPC_SSH_MCP_CONFIG` at your own path.
+
+```toml
+[derecho]
+center  = "ncar"                          # ncar -> PBS, curc -> Slurm
+role    = "login"                         # login | data-access | compute | workstation
+account = "UABC0001"                      # default -A for run_on_compute / submit_job
+scratch = "/glade/derecho/scratch/$USER"  # suggested remote_dir for job output
+```
+
+`role = "data-access"` allows transfers while still routing compute away; `role = "workstation"` lifts login-node routing entirely for a machine you own. A missing or malformed file simply means no profiles.
 
 ## Testing
 
@@ -90,9 +113,18 @@ The unit suite mocks `subprocess.run`; the live suite exists because several 1.1
 
 ## Version
 
-1.1.0
+1.2.0
 
 ## Changelog
+
+### 1.2.0
+
+- **Command policy tiers** on `execute_remote_bash` and `run_on_compute` (block / confirm / route / free), with `confirm_destructive` and `allow_on_login_node` flags. See [Command policy](#command-policy).
+- **Host profiles** (`~/.config/hpc-ssh-mcp/hosts.toml`): per-alias `center`, `role`, `account` and `scratch`. The center picks PBS or Slurm without a probe, the role sets the policy tier, and the account defaults the `-A` flag.
+- **Scheduler polling is rate-limited** to one identical query per host per 30 s, so an agent loop cannot become the "aggressive squeue" pattern HPC centers flag.
+- **Bulk-transfer notice.** Transfers over 2 GB append a pointer to Globus or a data-transfer node; a missing local file is now reported before `scp` runs.
+- **`submit_job` suggests the profile's scratch directory** when no `remote_dir` was given.
+- Requires Python 3.11+ (for `tomllib`).
 
 ### 1.1.0
 

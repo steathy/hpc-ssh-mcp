@@ -11,12 +11,14 @@ import os
 import re
 import shlex
 import subprocess
+import time
+import tomllib
 import uuid
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
@@ -29,6 +31,10 @@ DEFAULT_SCP_TIMEOUT = 3600
 # at MAX_OUTPUT_CHARS so a runaway command cannot flood the model's context.
 DEFAULT_MAX_BYTES = 200_000
 MAX_OUTPUT_CHARS = 200_000
+
+# scp over a login node is the wrong tool past a few GB: both centers point at
+# Globus or a data-transfer node for bulk movement.
+LARGE_TRANSFER_BYTES = 2_000_000_000
 
 # ssh reserves exit status 255 for its own failures (connection, auth, control
 # socket). Any other status belongs to the remote command, whose stderr must not
@@ -301,6 +307,22 @@ def _run_ssh_script_raw(host: str, script: str, timeout: int = DEFAULT_TIMEOUT) 
     return _run_ssh_raw(host, BASH_STDIN, timeout=timeout, input_data=script)
 
 
+def _large_transfer_notice(path: str) -> str:
+    """Point at Globus/DTN for files scp should not be moving over a login node."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ""
+    if size < LARGE_TRANSFER_BYTES:
+        return ""
+    gb = size / 1_000_000_000
+    return (
+        f"\n[{gb:.1f} GB transferred over scp. Both NSF NCAR and CU Boulder ask for bulk "
+        "data to move via Globus (collections: NCAR GLADE, NCAR Campaign Storage, "
+        "CU Boulder Research Computing) or a data-transfer node, not a login node.]"
+    )
+
+
 def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT) -> tuple[int, str]:
     """Run scp; return (rc, formatted output with a diagnostic hint on failure).
 
@@ -312,6 +334,86 @@ def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT)
     if rc == SSH_OWN_FAILURE_RC:
         formatted += _diagnose_ssh_failure(host, err)
     return rc, formatted
+
+
+# ---------------------------------------------------------------------------
+# Host profiles
+# ---------------------------------------------------------------------------
+# An optional TOML file keyed by SSH alias, so the server knows what a host is
+# instead of guessing. Everything in it is optional; an absent or malformed
+# file simply means "no profiles".
+#
+#   ~/.config/hpc-ssh-mcp/hosts.toml   (override with $HPC_SSH_MCP_CONFIG)
+#
+#   [derecho]
+#   center  = "ncar"                          # ncar -> PBS, curc -> Slurm
+#   role    = "login"                         # login | data-access | dtn | compute | workstation
+#   account = "UABC0001"                      # default -A / --account
+#   scratch = "/glade/derecho/scratch/$USER"  # suggested job directory
+
+DEFAULT_CONFIG_PATH = "~/.config/hpc-ssh-mcp/hosts.toml"
+CENTER_SCHEDULERS = {"ncar": "pbs", "curc": "slurm"}
+# A data-access node or DTN is meant for moving data, so transfers are normal
+# there while compute is still routed away.
+_ROLE_ALIASES = {"data-access": "dtn", "datamover": "dtn", "transfer": "dtn"}
+VALID_ROLES = ("login", "dtn", "compute", "workstation")
+
+_PROFILE_CACHE: dict | None = None
+
+
+def _load_profiles() -> dict:
+    """Read the profile file once. Any problem with it means 'no profiles'."""
+    global _PROFILE_CACHE
+    if _PROFILE_CACHE is None:
+        path = os.path.expanduser(os.environ.get("HPC_SSH_MCP_CONFIG", DEFAULT_CONFIG_PATH))
+        try:
+            with open(path, "rb") as fh:
+                loaded = tomllib.load(fh)
+            _PROFILE_CACHE = {k: v for k, v in loaded.items() if isinstance(v, dict)}
+        except (OSError, ValueError, tomllib.TOMLDecodeError):
+            _PROFILE_CACHE = {}
+    return _PROFILE_CACHE
+
+
+def _host_profile(host: str) -> dict:
+    """Profile for an SSH alias, or {} if the host is not described."""
+    return _load_profiles().get(host, {})
+
+
+def _host_role(host: str) -> str:
+    """Role of a host: 'login', 'dtn', 'compute' or 'workstation'.
+
+    Login is the safe default: it is what an HPC alias almost always points at,
+    and it is the role with the strictest routing rules.
+    """
+    role = str(_host_profile(host).get("role", "login"))
+    role = _ROLE_ALIASES.get(role, role)
+    return role if role in VALID_ROLES else "login"
+
+
+# ---------------------------------------------------------------------------
+# Scheduler-poll rate limiting
+# ---------------------------------------------------------------------------
+# Aalto and Purdue both call out agents that hammer squeue/qstat in a loop.
+# Repeated identical read-only scheduler queries inside this window return the
+# previous answer instead of opening another connection.
+SCHEDULER_POLL_INTERVAL = 30
+_POLL_CACHE: dict[tuple, tuple[float, str]] = {}
+
+
+def _cached_poll(key: tuple, produce) -> str:
+    """Return a recent identical scheduler answer, or produce and store a new one."""
+    now = time.monotonic()
+    hit = _POLL_CACHE.get(key)
+    if hit and now - hit[0] < SCHEDULER_POLL_INTERVAL:
+        age = int(now - hit[0])
+        return (
+            f"{hit[1]}\n[cached {age}s ago; scheduler queries are rate-limited to one per "
+            f"{SCHEDULER_POLL_INTERVAL}s per host. Wait before polling again.]"
+        )
+    result = produce()
+    _POLL_CACHE[key] = (now, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -503,15 +605,6 @@ _CALLABLE_RULES = (
 )
 
 
-def _host_role(host: str) -> str:
-    """Role of a host: 'login', 'dtn', 'compute' or 'workstation'.
-
-    Login is the safe default: it is what an HPC alias almost always points at,
-    and it is the role with the strictest routing rules.
-    """
-    return "login"
-
-
 def _classify_command(command: str, role: str = "login") -> tuple[str, str]:
     """Return (tier, rule) for a command, taking the strictest tier that applies."""
     worst, why = "free", ""
@@ -658,6 +751,9 @@ def _detect_scheduler(host: str) -> str:
 
 def _resolve_scheduler(host: str, scheduler: str) -> str:
     if scheduler == "auto":
+        center = str(_host_profile(host).get("center", "")).lower()
+        if center in CENTER_SCHEDULERS:
+            return CENTER_SCHEDULERS[center]
         return _detect_scheduler(host)
     if scheduler not in SCHEDULERS:
         raise ValueError(f"scheduler must be 'auto', 'pbs' or 'slurm', got {scheduler!r}")
@@ -739,7 +835,14 @@ def submit_job(
         return msg
 
     submit = f"qsub {safe_fn}" if sched == "pbs" else f"sbatch -- {safe_fn}"
-    return _run_ssh_script(host, enter + submit)
+    result = _run_ssh_script(host, enter + submit)
+    scratch = str(_host_profile(host).get("scratch", ""))
+    if not remote_dir and scratch:
+        result += (
+            f"\n[submitted from the SSH login directory. For run data, pass "
+            f"remote_dir={scratch} so output lands on scratch instead of $HOME.]"
+        )
+    return result
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -777,7 +880,7 @@ def check_job(host: str, job_id: str, scheduler: str = "auto") -> str:
             "echo '=== sacct (accounting) ==='\n"
             f"sacct -j {sid} --format=JobID,JobName,Partition,State,ExitCode,Elapsed,Start,End --parsable2\n"
         )
-    return _run_ssh_script(host, script)
+    return _cached_poll(("job", host, script), lambda: _run_ssh_script(host, script))
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -804,7 +907,7 @@ def list_queue(host: str, user: str = "", scheduler: str = "auto") -> str:
         script = f"qstat -w -u {who}"
     else:
         script = f"squeue -u {who} --format='{_SQUEUE_FORMAT}'"
-    return _run_ssh_script(host, script)
+    return _cached_poll(("queue", host, script), lambda: _run_ssh_script(host, script))
 
 
 @mcp.tool(annotations=_OVERWRITES)
@@ -869,6 +972,8 @@ def run_on_compute(
     _validate_directive("resources", resources)
     _validate_directive("walltime", walltime, _VALID_WALLTIME_RE)
     sched = _resolve_scheduler(host, scheduler)
+    account = account or str(_host_profile(host).get("account", ""))
+    _validate_directive("account", account)
     quoted = shlex.quote(command)
     if sched == "pbs":
         parts = ["qcmd"]
@@ -994,6 +1099,8 @@ def scp_download_file(
         # A timed-out scp leaves a silently truncated destination behind.
         os.remove(local_abs)
         result += f"\nPartial download removed: {local_abs}"
+    elif rc == 0:
+        result += _large_transfer_notice(local_abs)
     return result
 
 
@@ -1016,10 +1123,14 @@ def scp_upload_file(
     """
     _validate_host(host)
     _validate_timeout(timeout)
+    local_abs = _local_path(local_path)
+    if not os.path.exists(local_abs):
+        return f"Local file not found: {local_abs}"
+    notice = _large_transfer_notice(local_abs)
     _, result = _run_scp(
-        host, [_local_path(local_path), _scp_remote_spec(host, remote_path)], timeout=timeout,
+        host, [local_abs, _scp_remote_spec(host, remote_path)], timeout=timeout,
     )
-    return result
+    return result + notice
 
 
 @mcp.tool(annotations=_READ_ONLY)

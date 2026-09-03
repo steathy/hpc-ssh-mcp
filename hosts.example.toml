@@ -1,0 +1,36 @@
+# Example host profiles for hpc-ssh-mcp.
+#
+# Copy to ~/.config/hpc-ssh-mcp/hosts.toml (or point $HPC_SSH_MCP_CONFIG at it)
+# and edit. Every field is optional; an absent file just means "no profiles",
+# in which case the server probes for the scheduler and assumes a login node.
+#
+# Each table name is an SSH alias exactly as it appears in ~/.ssh/config.
+
+[derecho]
+center  = "ncar"                          # ncar -> PBS Pro, curc -> Slurm (skips the probe)
+role    = "login"                         # login | data-access | compute | workstation
+account = "UABC0001"                      # default -A for run_on_compute and job submission
+scratch = "/glade/derecho/scratch/$USER"  # suggested remote_dir for job output
+
+[casper]
+center  = "ncar"
+role    = "login"
+account = "UABC0001"
+scratch = "/glade/campaign/$USER"
+
+# The NCAR data-access nodes exist to move data. Transfers are normal here;
+# compute is still routed to a real compute node.
+[ncar-data]
+center = "ncar"
+role   = "data-access"
+
+[cu-alpine]
+center  = "curc"
+role    = "login"
+account = "ucb-general"
+scratch = "/scratch/alpine/$USER"         # CURC purges scratch after 90 days
+
+# A machine you own: no login-node etiquette applies, so heavy commands run
+# without needing allow_on_login_node. Destructive commands are still guarded.
+[my-workstation]
+role = "workstation"

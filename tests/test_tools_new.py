@@ -32,27 +32,31 @@ class TestCheckSshConnection:
 
 
 class TestScpUploadFile:
-    def test_calls_scp_upload_correctly(self, mock_subprocess):
+    def test_calls_scp_upload_correctly(self, mock_subprocess, tmp_path):
+        src = tmp_path / "input.nc"
+        src.write_text("payload")
         mock_subprocess.return_value = make_completed_process(returncode=0)
         from ssh_hpc_server import scp_upload_file
         result = scp_upload_file(
             host="derecho",
-            local_path="/data/me/input.nc",
+            local_path=str(src),
             remote_path="/scratch/user/input.nc",
         )
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "scp"
         # local source and remote dest are always the last two argv elements
-        assert cmd[-2] == "/data/me/input.nc"
+        assert cmd[-2] == str(src)
         assert "derecho:" in cmd[-1]
 
-    def test_reports_upload_failure(self, mock_subprocess):
+    def test_reports_upload_failure(self, mock_subprocess, tmp_path):
+        src = tmp_path / "x"
+        src.write_text("payload")
         mock_subprocess.return_value = make_completed_process(
             returncode=1, stderr="Permission denied\n",
         )
         from ssh_hpc_server import scp_upload_file
         result = scp_upload_file(
-            host="derecho", local_path="/tmp/x", remote_path="/nope",
+            host="derecho", local_path=str(src), remote_path="/nope",
         )
         assert "[EXIT CODE 1]" in result
 
@@ -60,6 +64,14 @@ class TestScpUploadFile:
         from ssh_hpc_server import scp_upload_file
         with pytest.raises(ValueError):
             scp_upload_file(host="bad; host", local_path="/a", remote_path="/b")
+
+    def test_missing_local_file_is_reported(self, mock_subprocess, tmp_path):
+        from ssh_hpc_server import scp_upload_file
+        result = scp_upload_file(
+            host="derecho", local_path=str(tmp_path / "absent.nc"), remote_path="/r/x",
+        )
+        assert "not found" in result.lower()
+        mock_subprocess.assert_not_called()
 
 
 class TestTailRemoteFile:
