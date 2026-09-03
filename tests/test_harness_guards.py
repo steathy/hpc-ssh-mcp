@@ -61,7 +61,7 @@ def _tool_names() -> set[str]:
 # ---------------------------------------------------------------------------
 # Session reuse through the system ssh/scp binaries is the reason this project
 # exists, and _run_raw is where every remote call is funnelled so that stdin
-# isolation, UTF-8 replacement and the timeout note apply uniformly. A new tool
+# isolation and UTF-8 replacement apply uniformly. A new tool
 # calling subprocess.run directly would bypass all of it, silently.
 
 class TestSubprocessBoundary:

@@ -52,6 +52,11 @@ _TIMEOUT_ORPHAN_NOTE = (
     "ssh client was killed. Check with execute_remote_bash(host, 'pgrep -au $USER') before "
     "retrying, and stop it there if it is still going."
 )
+# run_on_compute's orphan is a scheduler job as well as a login-node process.
+_COMPUTE_TIMEOUT_NOTE = (
+    "\nThe job it submitted may also still be queued or running on the scheduler: check "
+    "with list_queue and stop it with cancel_job before retrying."
+)
 
 # Applied to every ssh/scp invocation that actually opens a connection.
 # BatchMode=yes:    refuse interactive auth (password, keyboard-interactive/MFA);
@@ -202,7 +207,7 @@ def _run_raw(
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode(errors="replace")
         stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
-        return -1, stdout, f"Timed out after {timeout}s. {stderr}{_TIMEOUT_ORPHAN_NOTE}"
+        return -1, stdout, f"Timed out after {timeout}s. {stderr}"
     except FileNotFoundError:
         return -1, "", f"Command not found: {cmd[0]}. Is it installed and on PATH?"
 
@@ -314,7 +319,7 @@ def _run_ssh_checked(
     Callers that must not remember a failure (see _cached_poll) need the status
     as well as the text.
     """
-    rc, out, err = _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
+    rc, out, err = _run_ssh_raw(host, remote_cmd, timeout=timeout, input_data=input_data)
     formatted = _format_result(rc, out, err)
     if rc == SSH_OWN_FAILURE_RC:
         formatted += _diagnose_ssh_failure(host, err)
@@ -337,8 +342,16 @@ def _run_ssh_raw(
     timeout: int = DEFAULT_TIMEOUT,
     input_data: str | None = None,
 ) -> tuple[int, str, str]:
-    """Like _run_ssh, but returns the raw (rc, stdout, stderr) for callers that branch on rc."""
-    return _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
+    """Like _run_ssh, but returns the raw (rc, stdout, stderr) for callers that branch on rc.
+
+    Every remote command passes through here, so this is where a timeout gains
+    the orphan note. scp and the Globus CLI do not: killing the local scp ends
+    the remote sftp-server with the session, and Globus has no remote at all.
+    """
+    rc, out, err = _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
+    if rc == -1 and err.startswith("Timed out"):
+        err += _TIMEOUT_ORPHAN_NOTE
+    return rc, out, err
 
 
 # A remote script is delivered on stdin to `bash -s` rather than interpolated
@@ -1335,7 +1348,10 @@ def run_on_compute(
             parts.append(f"--{key}={value}")
         parts.append(f"--time={walltime}")
         parts += ["bash", "-c", quoted]
-    return _run_ssh_script(host, " ".join(parts), timeout=timeout)
+    result = _run_ssh_script(host, " ".join(parts), timeout=timeout)
+    if _TIMEOUT_ORPHAN_NOTE in result:
+        result += _COMPUTE_TIMEOUT_NOTE
+    return result
 
 
 @mcp.tool(annotations=_READ_ONLY)

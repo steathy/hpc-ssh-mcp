@@ -102,3 +102,56 @@ class TestSuggestedScratchIsConcrete:
         """What submit_job will run: the quoted path must still be the path."""
         quoted = ssh_hpc_server._shell_path("/glade/derecho/scratch/jdoe")
         assert quoted.strip("'") == "/glade/derecho/scratch/jdoe"
+
+
+# ---------------------------------------------------------------------------
+# F6: the orphan-process note is true for a remote command and for nothing else
+# ---------------------------------------------------------------------------
+# It was attached in _run_raw, which every subprocess goes through. A timed-out
+# scp does not leave a remote process (the sftp-server dies with the session:
+# verified on a live host); the Globus CLI is a local process with no remote at
+# all; and a timed-out run_on_compute leaves a *job*, which pgrep on the login
+# node will never find.
+
+def _timeout(cmd="ssh", seconds=3):
+    return subprocess.TimeoutExpired(cmd=[cmd], timeout=seconds, output="", stderr="")
+
+
+class TestTimeoutNoteIsAttachedWhereItIsTrue:
+    def test_run_raw_itself_says_only_that_it_timed_out(self, mock_subprocess):
+        mock_subprocess.side_effect = _timeout()
+        rc, out, err = ssh_hpc_server._run_raw(["ssh", "h", "sleep 9"], timeout=3)
+        assert rc == -1
+        assert err.startswith("Timed out after 3s"), err
+        assert "pgrep" not in err
+
+    def test_a_remote_command_still_gets_the_warning(self, mock_subprocess):
+        mock_subprocess.side_effect = _timeout()
+        result = ssh_hpc_server.execute_remote_bash(host="derecho", command="sleep 300", timeout=3)
+        assert "NOT stopped" in result and "pgrep" in result, result
+
+    def test_a_raw_remote_command_gets_it_too(self, mock_subprocess):
+        """read_remote_file and probe_host take the raw path; they must not lose it."""
+        mock_subprocess.side_effect = _timeout()
+        result = ssh_hpc_server.read_remote_file(host="derecho", remote_path="/tmp/x")
+        assert "NOT stopped" in result, result
+
+    def test_scp_does_not_claim_an_orphan(self, mock_subprocess, tmp_path):
+        mock_subprocess.side_effect = _timeout("scp")
+        result = ssh_hpc_server.scp_download_file("derecho", "/tmp/x.nc", str(tmp_path / "x.nc"), timeout=3)
+        assert "Timed out after 3s" in result
+        assert "pgrep" not in result and "NOT stopped" not in result, result
+
+    def test_globus_does_not_claim_an_orphan(self, mock_subprocess, monkeypatch):
+        monkeypatch.setattr(ssh_hpc_server.shutil, "which", lambda name: "/usr/bin/globus")
+        mock_subprocess.side_effect = _timeout("globus", 120)
+        result = ssh_hpc_server.globus_status()
+        assert "Timed out" in result
+        assert "pgrep" not in result and "remote command" not in result, result
+
+    def test_run_on_compute_points_at_the_job_not_at_pgrep_alone(self, mock_subprocess):
+        mock_subprocess.side_effect = _timeout()
+        result = ssh_hpc_server.run_on_compute(
+            host="derecho", command="python3 heavy.py", account="UABC0001", scheduler="pbs", timeout=3,
+        )
+        assert "list_queue" in result and "cancel_job" in result, result

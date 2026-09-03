@@ -184,6 +184,20 @@ class TestLiveScp:
         _ok(scp_download_file(HOST, f"~/{home_file}", str(back)))
         assert back.read_text() == "via scp\n"
 
+    def test_a_timed_out_download_does_not_claim_a_remote_orphan(self, remote_dir, tmp_path):
+        """Round 1 (1.10.0) F6: the orphan note was attached to every subprocess.
+        Killing the local scp ends the remote sftp-server with the session, so
+        the note was false here -- and a partial file must not be left behind."""
+        big = f"{remote_dir}/sparse.bin"
+        # truncate is confirm tier; a 3 GB sparse file costs nothing to create.
+        _ok(execute_remote_bash(HOST, f"truncate -s 3G '{big}'", confirm_destructive=True))
+        dest = tmp_path / "sparse.bin"
+        out = scp_download_file(HOST, big, str(dest), timeout=2)
+        assert "Timed out after 2s" in out, out
+        assert "pgrep" not in out and "NOT stopped" not in out, out
+        assert not dest.exists(), "a partial download was left behind"
+        assert "Partial download removed" in out, out
+
 
 class TestLivePolicy:
     """The guard runs before the connection, so these never reach the host."""
