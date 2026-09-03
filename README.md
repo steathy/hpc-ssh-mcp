@@ -406,9 +406,16 @@ The unit suite mocks `subprocess.run`. The live suite exists because several rea
 
 ## Version
 
-1.9.0
+1.10.0
 
 ## Changelog
+
+### 1.10.0
+
+**No functional change to the server.** Packaging and tests only.
+
+- **`README.md` is declared as the long description.** `pyproject.toml` had no `readme` key, so every built distribution carried the one-line summary and a blank body: on any index that renders a package page, this project's only document was present as a file and absent from the page.
+- **`tests/test_harness_guards.py` turns the project's own invariants into checks** — that `subprocess.run` appears in exactly two functions, that no native SSH library is imported, that the policy tier and role tables only use values that exist, that `record_host`'s parameters and the stored setting keys agree, that the tool table in this README matches the registered tools, that every tool carries MCP annotations, that the poll cache wraps only read-only tools, and that the module has not outgrown its single file. Every list is derived from the code rather than restated, so a new addition cannot be silently omitted.
 
 ### 1.9.0
 

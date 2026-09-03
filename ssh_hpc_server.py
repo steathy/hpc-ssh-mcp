@@ -20,7 +20,7 @@ import uuid
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
