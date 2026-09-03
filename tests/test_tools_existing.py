@@ -24,7 +24,8 @@ class TestExecuteRemoteBash:
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "ssh"
         assert "derecho" in cmd
-        assert "bash -c" in cmd[-1]
+        assert cmd[-1] == "bash -s"
+        assert mock_subprocess.call_args.kwargs["input"] == "ls"
 
     def test_rejects_invalid_host(self):
         with pytest.raises(ValueError):
@@ -122,8 +123,8 @@ class TestSubmitSlurmJob:
         """execute_remote_bash should force bash regardless of login shell."""
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
         execute_remote_bash(host="derecho", command="echo hello")
-        cmd = mock_subprocess.call_args[0][0][-1]
-        assert cmd.startswith("bash -c ")
+        assert mock_subprocess.call_args[0][0][-1] == "bash -s"
+        assert mock_subprocess.call_args.kwargs["input"] == "echo hello"
 
 
 class TestCheckSlurmJob:

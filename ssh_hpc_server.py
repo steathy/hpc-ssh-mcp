@@ -312,19 +312,25 @@ def execute_remote_bash(
     command: str,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
-    """Execute a bash command on a remote SSH host.
+    """Execute a bash command (or multi-line script) on a remote SSH host.
 
     The host must match an alias in ~/.ssh/config. Uses the system ssh
-    binary so ControlMaster multiplex sockets are respected.
+    binary so ControlMaster multiplex sockets are respected. The command is
+    delivered on stdin to `bash -s`, so pipes, quotes, newlines and '!' all
+    arrive intact whatever the remote login shell is. The script itself has
+    no stdin (commands that wait for input will see EOF).
+
+    Runs on the node you SSH into, usually a login node: keep it to short,
+    light commands and submit anything heavy as a job.
 
     Args:
         host: SSH config alias or hostname.
-        command: The bash command string to execute remotely.
+        command: The bash command string or script to execute remotely.
         timeout: Max seconds to wait (default 120).
     """
     _validate_host(host)
     _validate_timeout(timeout)
-    return _run_ssh(host, f"bash -c {shlex.quote(command)}", timeout=timeout)
+    return _run_ssh_script(host, command, timeout=timeout)
 
 
 @mcp.tool()

@@ -342,3 +342,24 @@ class TestGlobalOutputCap:
         result = execute_remote_bash(host="derecho", command="cat big")
         assert len(result) < ssh_hpc_server.MAX_OUTPUT_CHARS + 500
         assert "truncated" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Finding 10: commands travel on stdin to `bash -s`, not through the login shell
+# ---------------------------------------------------------------------------
+
+class TestExecuteRemoteBashViaStdin:
+    def test_remote_argv_is_only_bash_s(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
+        execute_remote_bash(host="derecho", command="ls | grep foo")
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[-1] == "bash -s"
+        assert mock_subprocess.call_args.kwargs["input"] == "ls | grep foo"
+
+    def test_multiline_and_csh_hostile_text_is_delivered_verbatim(self, mock_subprocess):
+        """Newlines, '!' and single quotes would all break under a tcsh login shell."""
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
+        script = "set -e\necho 'it''s ready!'\nqstat -u $USER 2>/dev/null\n"
+        execute_remote_bash(host="derecho", command=script)
+        assert mock_subprocess.call_args.kwargs["input"] == script
+        assert "'" not in mock_subprocess.call_args[0][0][-1]

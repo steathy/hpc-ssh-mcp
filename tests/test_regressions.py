@@ -169,32 +169,31 @@ class TestTimeoutOutputDecoding:
 # ---------------------------------------------------------------------------
 
 class TestBashExecution:
-    def test_command_wrapped_in_bash_c(self, mock_subprocess):
+    """The command is delivered on stdin to `bash -s`: the remote login shell
+    never parses it, so quotes, pipes and newlines cannot be mangled."""
+
+    def test_remote_command_is_bash_reading_stdin(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
         from ssh_hpc_server import execute_remote_bash
         execute_remote_bash(host="derecho", command="echo $SHELL")
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "ssh"
         assert "derecho" in cmd
-        assert cmd[-1].startswith("bash -c ")
+        assert cmd[-1] == "bash -s"
 
-    def test_command_with_quotes_properly_escaped(self, mock_subprocess):
-        """Commands containing quotes must survive the bash -c + shlex.quote wrapping."""
+    def test_command_with_quotes_delivered_verbatim(self, mock_subprocess):
+        """Quotes must reach bash exactly as written, with no escaping layer."""
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
         from ssh_hpc_server import execute_remote_bash
         execute_remote_bash(host="derecho", command="echo 'hello world'")
-        cmd = mock_subprocess.call_args[0][0][-1]
-        assert "bash -c " in cmd
-        assert "hello world" in cmd
+        assert mock_subprocess.call_args.kwargs["input"] == "echo 'hello world'"
 
     def test_command_with_pipes(self, mock_subprocess):
-        """Piped commands must work inside the bash wrapper."""
+        """Piped commands are bash syntax and must arrive intact."""
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
         from ssh_hpc_server import execute_remote_bash
         execute_remote_bash(host="derecho", command="ls | grep foo")
-        cmd = mock_subprocess.call_args[0][0][-1]
-        assert "bash -c " in cmd
-        assert "ls | grep foo" in cmd
+        assert mock_subprocess.call_args.kwargs["input"] == "ls | grep foo"
 
 
 # ---------------------------------------------------------------------------
