@@ -44,7 +44,9 @@ def remote_dir():
     d = f"/tmp/hpc-ssh-mcp-test-{uuid.uuid4().hex[:8]}"
     _ok(execute_remote_bash(HOST, f"mkdir -p '{d}/sub dir'"))
     yield d
-    execute_remote_bash(HOST, f"rm -rf '{d}'")
+    # confirm_destructive: the policy layer refuses recursive deletes otherwise,
+    # and a silently skipped teardown leaves directories on the host.
+    _ok(execute_remote_bash(HOST, f"rm -rf '{d}'", confirm_destructive=True))
 
 
 @pytest.fixture
@@ -52,7 +54,7 @@ def home_file():
     """A file under the remote $HOME, for '~' tests."""
     name = f".hpc-ssh-mcp-test-{uuid.uuid4().hex[:8]}"
     yield name
-    execute_remote_bash(HOST, f"rm -f ~/{name}")
+    _ok(execute_remote_bash(HOST, f"rm -f ~/{name}"))
 
 
 class TestLiveShell:
@@ -121,6 +123,30 @@ class TestLiveScp:
         back = tmp_path / "t-back.txt"
         _ok(scp_download_file(HOST, f"~/{home_file}", str(back)))
         assert back.read_text() == "via scp\n"
+
+
+class TestLivePolicy:
+    """The guard runs before the connection, so these never reach the host."""
+
+    def test_blocked_command_is_not_executed(self, remote_dir):
+        marker = f"{remote_dir}/blocked-ran"
+        out = execute_remote_bash(HOST, f"sudo touch '{marker}'")
+        assert "Blocked" in out
+        assert "No such file" in execute_remote_bash(HOST, f"ls '{marker}'")
+
+    def test_confirm_tier_runs_only_with_the_flag(self, remote_dir):
+        victim = f"{remote_dir}/sub dir"
+        assert "confirm_destructive" in execute_remote_bash(HOST, f"rm -rf '{victim}'")
+        assert _ok(execute_remote_bash(HOST, f"test -d '{victim}' && echo still-there")).strip() == "still-there"
+        _ok(execute_remote_bash(HOST, f"rm -rf '{victim}'", confirm_destructive=True))
+        assert "No such file" in execute_remote_bash(HOST, f"ls '{victim}'")
+
+    def test_route_tier_runs_only_with_the_flag(self, remote_dir):
+        script = f"{remote_dir}/hello.py"
+        _ok(execute_remote_bash(HOST, f"printf 'print(1)\\n' > '{script}'"))
+        out = execute_remote_bash(HOST, f"python3 '{script}'")
+        assert "run_on_compute" in out
+        assert _ok(execute_remote_bash(HOST, f"python3 '{script}'", allow_on_login_node=True)).strip() == "1"
 
 
 class TestLiveConnection:
