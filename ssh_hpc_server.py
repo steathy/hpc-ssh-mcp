@@ -14,8 +14,9 @@ import subprocess
 import uuid
 
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
@@ -42,6 +43,14 @@ SSH_OWN_FAILURE_RC = 255
 # ConnectTimeout=10: bound the TCP handshake so an unreachable host fails fast
 #                   instead of riding the OS default (~75-120s).
 SSH_OPTS: tuple[str, ...] = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
+
+# MCP tool annotations. Clients use these to decide what may run without a
+# prompt (read-only, idempotent) and what deserves confirmation (destructive).
+# openWorldHint is always True: every tool talks to a remote system.
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
+_ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
+_OVERWRITES = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True)
+_ARBITRARY = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
 
 _VALID_HOST_RE = re.compile(r"^[a-zA-Z0-9._@-]+$")
 _VALID_SLURM_JOB_ID_RE = re.compile(r"^\d+([_.]\d+)*$")
@@ -309,7 +318,7 @@ def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT)
 # MCP Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=_ARBITRARY)
 def execute_remote_bash(
     host: str,
     command: str,
@@ -406,7 +415,7 @@ def _validate_directive(name: str, value: str, pattern: re.Pattern = None) -> No
         raise ValueError(f"Invalid {name}: {value!r}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 def submit_job(
     host: str,
     job_script_content: str,
@@ -465,7 +474,7 @@ def submit_job(
     return _run_ssh_script(host, enter + submit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def check_job(host: str, job_id: str, scheduler: str = "auto") -> str:
     """Check the status of a batch job, including one that has already finished.
 
@@ -503,7 +512,7 @@ def check_job(host: str, job_id: str, scheduler: str = "auto") -> str:
     return _run_ssh_script(host, script)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_queue(host: str, user: str = "", scheduler: str = "auto") -> str:
     """List batch jobs in the queue for a user (qstat on PBS, squeue on Slurm).
 
@@ -530,7 +539,7 @@ def list_queue(host: str, user: str = "", scheduler: str = "auto") -> str:
     return _run_ssh_script(host, script)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_OVERWRITES)
 def cancel_job(host: str, job_id: str, scheduler: str = "auto") -> str:
     """Cancel a batch job by ID (qdel on PBS, scancel on Slurm).
 
@@ -545,7 +554,7 @@ def cancel_job(host: str, job_id: str, scheduler: str = "auto") -> str:
     return _run_ssh_script(host, f"qdel {sid}" if sched == "pbs" else f"scancel {sid}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ARBITRARY)
 def run_on_compute(
     host: str,
     command: str,
@@ -611,7 +620,7 @@ def run_on_compute(
     return _run_ssh_script(host, " ".join(parts), timeout=timeout)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def read_remote_file(
     host: str,
     remote_path: str,
@@ -659,7 +668,7 @@ def read_remote_file(
     return _format_result(rc, out, err)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def tail_remote_file(
     host: str,
     remote_path: str,
@@ -682,7 +691,7 @@ def tail_remote_file(
     return _run_ssh_script(host, f"tail -n {int(lines)} -- {_shell_path(remote_path)}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_OVERWRITES)
 def scp_download_file(
     host: str,
     remote_path: str,
@@ -712,7 +721,7 @@ def scp_download_file(
     return result
 
 
-@mcp.tool()
+@mcp.tool(annotations=_OVERWRITES)
 def scp_upload_file(
     host: str,
     local_path: str,
@@ -737,7 +746,7 @@ def scp_upload_file(
     return result
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def check_ssh_connection(host: str) -> str:
     """Check if the SSH ControlMaster multiplex socket for a host is alive.
 

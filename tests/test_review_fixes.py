@@ -363,3 +363,44 @@ class TestExecuteRemoteBashViaStdin:
         execute_remote_bash(host="derecho", command=script)
         assert mock_subprocess.call_args.kwargs["input"] == script
         assert "'" not in mock_subprocess.call_args[0][0][-1]
+
+
+# ---------------------------------------------------------------------------
+# Finding 13: MCP tool annotations so clients can tell reads from writes
+# ---------------------------------------------------------------------------
+
+class TestToolAnnotations:
+    READ_ONLY = {"read_remote_file", "tail_remote_file", "check_job", "list_queue", "check_ssh_connection"}
+    MUTATING = {"execute_remote_bash", "submit_job", "cancel_job", "run_on_compute",
+                "scp_download_file", "scp_upload_file"}
+
+    async def _tools(self):
+        from fastmcp import Client
+        async with Client(ssh_hpc_server.mcp) as client:
+            return {t.name: t for t in await client.list_tools()}
+
+    @pytest.mark.asyncio
+    async def test_every_tool_is_classified(self):
+        tools = await self._tools()
+        assert set(tools) == self.READ_ONLY | self.MUTATING
+
+    @pytest.mark.asyncio
+    async def test_read_only_tools_are_marked_read_only_and_idempotent(self):
+        tools = await self._tools()
+        for name in self.READ_ONLY:
+            ann = tools[name].annotations
+            assert ann is not None and ann.readOnlyHint is True, name
+            assert ann.idempotentHint is True, name
+
+    @pytest.mark.asyncio
+    async def test_mutating_tools_are_not_marked_read_only(self):
+        tools = await self._tools()
+        for name in self.MUTATING:
+            ann = tools[name].annotations
+            assert ann is not None and ann.readOnlyHint is False, name
+
+    @pytest.mark.asyncio
+    async def test_cancel_and_shell_are_destructive(self):
+        tools = await self._tools()
+        for name in ("cancel_job", "execute_remote_bash"):
+            assert tools[name].annotations.destructiveHint is True, name

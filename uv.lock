@@ -418,7 +418,7 @@ wheels = [
 
 [[package]]
 name = "hpc-ssh-mcp"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
@@ -432,7 +432,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastmcp", specifier = ">=2.0.0" },
+    { name = "fastmcp", specifier = ">=3,<4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
 ]

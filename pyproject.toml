@@ -1,10 +1,10 @@
 [project]
 name = "hpc-ssh-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "SSH & HPC Remote Control MCP Server — universal bridge to SSH-enabled servers and supercomputers"
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp>=2.0.0",
+    "fastmcp>=3,<4",
 ]
 
 [tool.hatch.build.targets.wheel]
