@@ -80,8 +80,14 @@ class TestSharedRootTraversal:
     def test_still_blocked_on_a_data_access_node(self):
         assert tier("find /glade -name x", "dtn") == "block"
 
-    def test_not_blocked_on_your_own_workstation(self):
-        assert tier("find / -name x", "workstation") != "block"
+    def test_a_non_hpc_host_is_not_policed_at_all(self, tmp_path, monkeypatch):
+        """hpc=false turns the policy off, rather than being a role."""
+        cfg = tmp_path / "config"
+        cfg.write_text("Host box\n    # hpc-mcp: hpc=false\n")
+        monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(cfg))
+        monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
+        ssh_hpc_server._DIRECTIVE_CACHE = None
+        assert ssh_hpc_server._policy_mode("box") == "off"
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +130,7 @@ Host derecho
 
 Host my-box
     HostName 10.0.0.5
-    # hpc-mcp: role=workstation policy=off
+    # hpc-mcp: hpc=false
 
 Host loose
     HostName loose.example.edu

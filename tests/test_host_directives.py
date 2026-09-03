@@ -59,7 +59,7 @@ Host cu-alpine
 
 Host my-box
     HostName 10.0.0.5
-    # hpc-mcp: role=workstation policy=off
+    # hpc-mcp: hpc=false
 
 Host plain-host
     HostName plain.example.edu
@@ -143,7 +143,7 @@ class TestPatternMatching:
         cfg = tmp_path / "config"
         cfg.write_text(
             "Host derecho\n    # hpc-mcp: role=login\n\n"
-            "Host *\n    # hpc-mcp: role=workstation\n"
+            "Host *\n    # hpc-mcp: role=compute\n"
         )
         monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(cfg))
         ssh_hpc_server._DIRECTIVE_CACHE = None
@@ -178,7 +178,6 @@ class TestDirectivesDriveBehaviour:
     def test_role(self, ssh_config):
         assert _host_role("derecho") == "login"
         assert _host_role("ncar-data") == "dtn"
-        assert _host_role("my-box") == "workstation"
         assert _host_role("plain-host") == "login"
 
     def test_center_picks_the_scheduler_without_probing(self, ssh_config, mock_subprocess):
@@ -214,7 +213,7 @@ class TestDirectivesDriveBehaviour:
 
     def test_policy_mode(self, ssh_config, mock_subprocess):
         assert _policy_mode("derecho") == "strict"
-        assert _policy_mode("my-box") == "off"
+        assert _policy_mode("my-box") == "off"  # hpc=false lifts the policy
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
         execute_remote_bash(host="my-box", command="sudo ls")
         mock_subprocess.assert_called_once()

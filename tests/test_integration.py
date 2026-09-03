@@ -17,8 +17,11 @@ import uuid
 
 import pytest
 
+import ssh_hpc_server
 from ssh_hpc_server import (
     _detect_scheduler,
+    annotate_host,
+    probe_host,
     check_ssh_connection,
     execute_remote_bash,
     read_remote_file,
@@ -159,6 +162,38 @@ class TestLivePolicy:
         out = execute_remote_bash(HOST, f"python3 '{script}'")
         assert "run_on_compute" in out
         assert _ok(execute_remote_bash(HOST, f"python3 '{script}'", allow_on_login_node=True)).strip() == "1"
+
+
+class TestLiveOnboarding:
+    """probe_host reads the real machine; annotate_host writes a scratch config."""
+
+    @pytest.fixture
+    def scratch_config(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config"
+        cfg.write_text(f"Host {HOST}\n    HostName {HOST}\n    ControlMaster auto\n")
+        monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(cfg))
+        ssh_hpc_server._DIRECTIVE_CACHE = None
+        ssh_hpc_server._ONBOARDING_SEEN.clear()
+        yield cfg
+        ssh_hpc_server._DIRECTIVE_CACHE = None
+        ssh_hpc_server._ONBOARDING_SEEN.clear()
+
+    def test_probe_reports_the_real_host(self, scratch_config):
+        out = probe_host(HOST)
+        assert "Detected:" in out
+        assert "hostname" in out
+        assert "annotate_host" in out or "is_hpc=False" in out
+
+    def test_annotate_round_trip(self, scratch_config):
+        assert "Annotated" in annotate_host(HOST, is_hpc=False)
+        assert "# hpc-mcp: hpc=false" in scratch_config.read_text()
+        assert ssh_hpc_server._is_hpc(HOST) is False
+        assert ssh_hpc_server._policy_mode(HOST) == "off"
+        assert scratch_config.with_suffix(".hpc-mcp.bak").exists()
+
+    def test_non_hpc_host_runs_a_routed_command_without_a_flag(self, scratch_config):
+        annotate_host(HOST, is_hpc=False)
+        assert _ok(execute_remote_bash(HOST, "python3 -c 'print(41+1)'")).strip() == "42"
 
 
 class TestLiveConnection:

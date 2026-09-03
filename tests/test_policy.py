@@ -63,7 +63,7 @@ class TestBlockTier:
         assert tier(cmd) == "block", cmd
 
     def test_block_applies_on_every_role(self):
-        for role in ("login", "dtn", "compute", "workstation"):
+        for role in ("login", "dtn", "compute"):
             assert tier("sudo ls", role) == "block"
 
     def test_block_has_no_override(self, mock_subprocess):
@@ -203,9 +203,9 @@ class TestRouteTier:
     def test_light_work_is_free(self, cmd):
         assert tier(cmd, "login") == "free", cmd
 
-    def test_route_does_not_apply_on_compute_or_workstation(self):
+    def test_route_does_not_apply_on_a_compute_node(self):
         assert tier("python analyze.py", "compute") == "free"
-        assert tier("make -j8", "workstation") == "free"
+        assert tier("make -j8", "compute") == "free"
 
     def test_dtn_allows_transfers_but_not_compute(self):
         assert tier("rsync -av src/ dest/", "dtn") == "free"

@@ -21,7 +21,7 @@ import uuid
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
@@ -282,7 +282,7 @@ def _run_ssh(
     formatted = _format_result(rc, out, err)
     if rc == SSH_OWN_FAILURE_RC:
         formatted += _diagnose_ssh_failure(host, err)
-    return formatted
+    return formatted + _onboarding_notice(host)
 
 
 def _run_ssh_raw(
@@ -354,8 +354,10 @@ def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT)
 #       # hpc-mcp: center=ncar role=login account=UABC0001
 #
 # Recognised keys, all optional:
+#   hpc      false           this is not a shared HPC system: no login-node
+#                            etiquette, no command policy
 #   center   ncar | curc     picks PBS or Slurm without probing the host
-#   role     login | data-access | compute | workstation   sets the policy tier
+#   role     login | data-access | compute   sets the policy tier
 #   account  charged by run_on_compute and submit_job (-A / --account)
 #   scratch  suggested job directory, quoted back when submit_job gets none
 #   globus   collection UUID for this system, so tools can name the host alias
@@ -373,7 +375,7 @@ CENTER_SCHEDULERS = {"ncar": "pbs", "curc": "slurm"}
 # A data-access node or DTN is meant for moving data, so transfers are normal
 # there while compute is still routed away.
 _ROLE_ALIASES = {"data-access": "dtn", "datamover": "dtn", "transfer": "dtn"}
-VALID_ROLES = ("login", "dtn", "compute", "workstation")
+VALID_ROLES = ("login", "dtn", "compute")
 
 # [(host patterns, {key: value})], in file order. None = not yet parsed.
 _DIRECTIVE_CACHE: list | None = None
@@ -442,11 +444,20 @@ def _host_directives(host: str) -> dict:
     return resolved
 
 
+_FALSEY = {"false", "no", "0", "off", "n"}
+
+
+def _is_hpc(host: str) -> bool:
+    """False when the host is annotated `hpc=false`: not a shared HPC system."""
+    return str(_host_directives(host).get("hpc", "true")).lower() not in _FALSEY
+
+
 def _host_role(host: str) -> str:
-    """Role of a host: 'login', 'dtn', 'compute' or 'workstation'.
+    """Role of a host: 'login', 'dtn' or 'compute'.
 
     Login is the safe default: it is what an HPC alias almost always points at,
-    and it is the role with the strictest routing rules.
+    and it is the role with the strictest routing rules. A machine that is not
+    an HPC system at all is `hpc=false`, not a role (see _is_hpc).
     """
     role = str(_host_directives(host).get("role", "login")).lower()
     role = _ROLE_ALIASES.get(role, role)
@@ -466,7 +477,7 @@ def _policy_mode(host: str) -> str:
 
     Resolution order: the environment variable the server was launched with,
     then a `policy=` annotation on the host (a `Host *` block sets a default
-    for everything), then strict.
+    for everything), then 'off' for a host annotated `hpc=false`, else strict.
     """
     for candidate in (
         os.environ.get(POLICY_ENV_VAR, ""),
@@ -477,7 +488,9 @@ def _policy_mode(host: str) -> str:
             return value
         if value:
             return "strict"  # a typo must not silently weaken the guard
-    return "strict"
+    # Login-node etiquette and the destructive-command guard exist because the
+    # machine is shared. Off an HPC system they do not apply.
+    return "strict" if _is_hpc(host) else "off"
 
 
 _RELAX_INSTRUCTIONS = (
@@ -1722,6 +1735,329 @@ def globus_task_cancel(task_id: str) -> str:
     if isinstance(data, dict):
         return f"{data.get('code', 'Cancelled')}: {data.get('message', 'task cancelled')}"
     return str(data)
+
+
+# ---------------------------------------------------------------------------
+# First contact with a host
+# ---------------------------------------------------------------------------
+# A host with no annotation still works: the server probes for a scheduler and
+# assumes a login node, which is the safe reading. But the first time a tool
+# touches such a host, say so once, so the agent can offer to describe it
+# properly instead of silently guessing forever.
+
+_ONBOARDING_SEEN: set[str] = set()
+
+_PROBE_SCRIPT = r"""
+printf 'hostname=%s\n' "$(hostname -f 2>/dev/null || hostname)"
+s=""
+command -v qsub   >/dev/null 2>&1 && s="qsub"
+command -v sbatch >/dev/null 2>&1 && s="${s:+$s }sbatch"
+printf 'scheduler=%s\n' "$s"
+printf 'account=%s\n' "${PBS_ACCOUNT:-${SLURM_ACCOUNT:-${SBATCH_ACCOUNT:-}}}"
+fs=""
+for d in /glade /glade/derecho/scratch /glade/work /glade/campaign \
+         /scratch/alpine /pl/active /projects; do
+    [ -d "$d" ] && fs="${fs:+$fs }$d"
+done
+printf 'filesystems=%s\n' "$fs"
+g=no
+command -v globus >/dev/null 2>&1 && g=yes
+# A non-login shell often misses the usual per-user bin directories.
+for p in "$HOME/.local/bin/globus" "$HOME/bin/globus"; do
+    [ -x "$p" ] && g=yes
+done
+printf 'globus=%s\n' "$g"
+"""
+
+
+def _onboarding_notice(host: str) -> str:
+    """Once per host per session, flag that this host has no annotation."""
+    if host in _ONBOARDING_SEEN or _host_directives(host):
+        _ONBOARDING_SEEN.add(host)
+        return ""
+    _ONBOARDING_SEEN.add(host)
+    return (
+        f"\n\n[first use of {host!r}: it has no `# hpc-mcp:` annotation in ~/.ssh/config, so "
+        "the server is assuming an HPC login node and probing for the scheduler each session. "
+        f"Run probe_host({host!r}) to see what it actually is, ask the user to confirm, then "
+        "call annotate_host to record it. Do this once; it is not urgent and everything works "
+        "meanwhile.]"
+    )
+
+
+def _infer_from_probe(fields: dict) -> dict:
+    """Turn raw probe output into a suggested annotation."""
+    scheduler = fields.get("scheduler", "").split()
+    filesystems = fields.get("filesystems", "").split()
+    hostname = fields.get("hostname", "")
+    suggestion: dict = {}
+
+    if "qsub" in scheduler and "sbatch" not in scheduler:
+        suggestion["scheduler_name"] = "PBS Pro"
+    elif "sbatch" in scheduler and "qsub" not in scheduler:
+        suggestion["scheduler_name"] = "Slurm"
+    elif scheduler:
+        suggestion["scheduler_name"] = "both PBS and Slurm (ambiguous)"
+
+    if any(p.startswith("/glade") for p in filesystems):
+        suggestion["center"] = "ncar"
+    elif any(p.startswith(("/scratch/alpine", "/pl")) for p in filesystems):
+        suggestion["center"] = "curc"
+
+    lowered = hostname.lower()
+    if "data-access" in lowered or "dtn" in lowered or "datamover" in lowered:
+        suggestion["role"] = "data-access"
+    elif scheduler:
+        suggestion["role"] = "login"
+
+    if fields.get("account"):
+        suggestion["account"] = fields["account"]
+    if suggestion.get("center") == "ncar":
+        suggestion["scratch"] = "/glade/derecho/scratch/$USER"
+    elif suggestion.get("center") == "curc":
+        suggestion["scratch"] = "/scratch/alpine/$USER"
+    suggestion["is_hpc"] = bool(scheduler or filesystems)
+    return suggestion
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def probe_host(host: str) -> str:
+    """Find out what a host is, so it can be described in ~/.ssh/config.
+
+    Detects the scheduler, the centre's filesystems, a default account and
+    whether the Globus CLI is present, then proposes an annotation and lists
+    what only the user can answer. Read-only: it writes nothing.
+
+    Call this the first time you touch an unfamiliar host, show the user what
+    came back, ask the questions it lists, and then call annotate_host with
+    their answers. Never guess on their behalf.
+
+    Args:
+        host: SSH config alias or hostname.
+    """
+    _validate_host(host)
+    existing = _host_directives(host)
+    rc, out, err = _run_ssh_script_raw(host, _PROBE_SCRIPT)
+    if rc != 0:
+        msg = f"Could not probe {host!r}:\n{_format_result(rc, out, err)}"
+        if rc == SSH_OWN_FAILURE_RC:
+            msg += _diagnose_ssh_failure(host, err)
+        return msg
+
+    fields = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+    guess = _infer_from_probe(fields)
+
+    lines = []
+    if existing:
+        lines.append(
+            f"{host!r} is already annotated with: "
+            + " ".join(f"{k}={v}" for k, v in sorted(existing.items()))
+            + ". Re-annotating will replace that.\n"
+        )
+    lines += [
+        "Detected:",
+        f"  hostname     {fields.get('hostname') or '(unknown)'}",
+        f"  scheduler    {guess.get('scheduler_name') or 'none found'}",
+        f"  filesystems  {fields.get('filesystems') or '(none of the known HPC mounts)'}",
+        f"  account      {fields.get('account') or '(none in the environment)'}",
+        f"  globus CLI   {fields.get('globus', 'unknown')}",
+        "",
+    ]
+
+    if not guess["is_hpc"]:
+        lines += [
+            "There is no scheduler and none of the known HPC filesystems, so this does not "
+            "look like a shared HPC system.",
+            "",
+            "Ask the user: is this a shared HPC system, or their own machine?",
+            "  If it is not HPC:  annotate_host(host, is_hpc=False)",
+            "     writes `# hpc-mcp: hpc=false`, and login-node etiquette and the command",
+            "     policy stop applying there.",
+            "  If it is HPC:      ask which centre and role, then annotate_host accordingly.",
+        ]
+        return "\n".join(lines)
+
+    proposed = {k: v for k, v in guess.items() if k in ("center", "role", "account", "scratch")}
+    lines += [
+        "Suggested annotation:",
+        "    # hpc-mcp: " + " ".join(f"{k}={v}" for k, v in sorted(proposed.items())),
+        "",
+        "Ask the user to confirm, and to answer what cannot be detected:",
+        f"  1. Is {host!r} a shared HPC system? (if not, annotate_host(host, is_hpc=False))",
+        "  2. Which project code should jobs charge? "
+        + (f"Detected {fields['account']}, confirm it." if fields.get("account")
+           else "Nothing is set in the environment, so they must supply it."),
+        "  3. Policy level: strict (default, block tier refused), permissive (block tier "
+        "becomes a confirmation), or off. Do not choose for them.",
+        "",
+        "Then record it, for example:",
+        "    annotate_host(host=" + repr(host) + ", "
+        + ", ".join(f"{k}={v!r}" for k, v in sorted(proposed.items())) + ")",
+    ]
+    if fields.get("globus") == "yes":
+        lines += [
+            "",
+            "The Globus CLI is installed on that host. If this system has a Globus collection, "
+            "look up its UUID with globus_find_collection and pass globus=<uuid> too, so "
+            "transfers can name the SSH alias.",
+        ]
+    return "\n".join(lines)
+
+
+_ANNOTATION_KEYS = ("hpc", "center", "role", "account", "scratch", "globus", "policy")
+
+
+def _validate_annotation(key: str, value: str) -> None:
+    """Values live in a single-line, space-separated comment, so keep them simple."""
+    if re.search(r"\s", value):
+        raise ValueError(f"Invalid {key}: {value!r} must not contain whitespace or newlines.")
+    if "#" in value:
+        raise ValueError(f"Invalid {key}: {value!r} must not contain '#'.")
+    if key == "center" and value not in CENTER_SCHEDULERS:
+        raise ValueError(f"Invalid center: {value!r}. Expected one of {', '.join(CENTER_SCHEDULERS)}.")
+    if key == "role":
+        canonical = _ROLE_ALIASES.get(value, value)
+        if canonical not in VALID_ROLES:
+            raise ValueError(
+                f"Invalid role: {value!r}. Expected login, data-access or compute. "
+                "A machine that is not an HPC system is is_hpc=False, not a role."
+            )
+    if key == "policy" and value not in POLICY_MODES:
+        raise ValueError(f"Invalid policy: {value!r}. Expected one of {', '.join(POLICY_MODES)}.")
+    if key == "account" and not _VALID_DIRECTIVE_RE.match(value):
+        raise ValueError(f"Invalid account: {value!r}.")
+    if key == "globus" and not _UUID_RE.match(value):
+        raise ValueError(f"Invalid globus collection UUID: {value!r}.")
+
+
+def _rewrite_annotation(text: str, host: str, annotation: str) -> tuple[str, str | None]:
+    """Return (new text, error). Replaces any existing annotation in host's block."""
+    lines = text.splitlines(keepends=True)
+    block_start = block_end = None
+    indent = "    "
+    for i, raw in enumerate(lines):
+        match = _HOST_LINE_RE.match(raw.strip())
+        if match:
+            if block_start is not None:
+                block_end = i
+                break
+            if host in match.group("patterns").split():
+                block_start = i
+    if block_start is None:
+        return text, (
+            f"{host!r} has no Host block in {_ssh_config_path()}, so there is nothing to "
+            f"annotate. Add one first, for example:\n\n    Host {host}\n"
+            f"        HostName <real hostname>\n        ControlMaster auto\n"
+            f"        ControlPath ~/.ssh/sockets/%r@%h-%p\n        ControlPersist 48h\n"
+        )
+    if block_end is None:
+        block_end = len(lines)
+
+    body = lines[block_start + 1:block_end]
+    for raw in body:
+        stripped = raw.strip()
+        if stripped and not stripped.startswith("#"):
+            indent = raw[:len(raw) - len(raw.lstrip())] or indent
+            break
+    kept = [raw for raw in body if not _DIRECTIVE_MARKER_RE.match(raw.strip())]
+    new_body = [f"{indent}# hpc-mcp: {annotation}\n"] + kept
+    return "".join(lines[:block_start + 1] + new_body + lines[block_end:]), None
+
+
+@mcp.tool(annotations=_ADDITIVE)
+def annotate_host(
+    host: str,
+    is_hpc: bool = True,
+    center: str = "",
+    role: str = "",
+    account: str = "",
+    scratch: str = "",
+    globus: str = "",
+    policy: str = "",
+) -> str:
+    """Record what a host is, as a `# hpc-mcp:` comment in ~/.ssh/config.
+
+    Only call this after probe_host and after the user has confirmed the
+    values: it edits their SSH config. A backup is written alongside the
+    file first, and nothing outside the host's own block is touched.
+
+    Args:
+        host: SSH config alias. A Host block for it must already exist.
+        is_hpc: False for a machine that is not a shared HPC system. Login-node
+            etiquette and the command policy stop applying there, and the
+            HPC-only fields are ignored.
+        center: 'ncar' or 'curc'. Selects PBS or Slurm without probing.
+        role: 'login', 'data-access' or 'compute'.
+        account: Project code to charge jobs to.
+        scratch: Suggested directory for job output.
+        globus: Globus collection UUID for this system.
+        policy: 'strict', 'permissive' or 'off'. Ask the user; never assume.
+    """
+    if any(ch in (host or "") for ch in "*?"):
+        return (
+            f"{host!r} is a wildcard pattern, not a specific host. Annotate the individual "
+            "hosts, or edit the Host * block by hand if you want a default for everything."
+        )
+    _validate_host(host)
+
+    values = {"center": center, "role": role, "account": account,
+              "scratch": scratch, "globus": globus, "policy": policy}
+    for key, value in values.items():
+        if value:
+            _validate_annotation(key, str(value))
+
+    if not is_hpc:
+        # Nothing about schedulers, accounts or filesystems applies off an HPC system.
+        pairs = {"hpc": "false"}
+        if policy:
+            pairs["policy"] = policy
+    else:
+        pairs = {k: v for k, v in values.items() if v}
+        if role:
+            pairs["role"] = _ROLE_ALIASES.get(role, role)
+    if not pairs:
+        return (
+            f"Nothing to write for {host!r}. Pass at least one of is_hpc=False, center, role, "
+            "account, scratch, globus or policy."
+        )
+
+    order = {key: i for i, key in enumerate(_ANNOTATION_KEYS)}
+    annotation = " ".join(f"{k}={pairs[k]}" for k in sorted(pairs, key=lambda k: order.get(k, 99)))
+
+    path = _ssh_config_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            original = fh.read()
+    except OSError as exc:
+        return f"Could not read {path}: {exc}"
+
+    updated, error = _rewrite_annotation(original, host, annotation)
+    if error:
+        return error
+
+    backup = path + ".hpc-mcp.bak"
+    try:
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        temp = path + ".hpc-mcp.tmp"
+        with open(temp, "w", encoding="utf-8") as fh:
+            fh.write(updated)
+        os.replace(temp, path)
+    except OSError as exc:
+        return f"Could not write {path}: {exc}"
+
+    global _DIRECTIVE_CACHE
+    _DIRECTIVE_CACHE = None
+    _ONBOARDING_SEEN.add(host)
+    _SCHEDULER_CACHE.pop(host, None)
+    return (
+        f"Annotated {host!r} in {path}:\n    # hpc-mcp: {annotation}\n"
+        f"Previous contents saved to {backup}."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -240,6 +240,8 @@ Every product above accepts an `env` object beside `command` and `args`. In Code
 | `scp_download_file` | Download a file via `scp` |
 | `scp_upload_file` | Upload a file via `scp` |
 | `check_ssh_connection` | Verify the ControlMaster socket is alive |
+| `probe_host` | Detect what a host is: scheduler, filesystems, account, Globus |
+| `annotate_host` | Record what a host is, as a comment in `~/.ssh/config` |
 | `globus_status` | Which Globus identity this machine is logged in as |
 | `globus_find_collection` | Search Globus for a collection UUID by name |
 | `globus_ls` | List a directory on a Globus collection |
@@ -290,13 +292,14 @@ Scheduler queries are rate-limited to one identical query per host every 30 seco
 Sometimes the guard is wrong, or you know exactly what you are doing and accept the risk. The override is deliberately **not a tool parameter**: a rail the agent can disable on its own is not a rail. Only you can relax it, either in `~/.ssh/config`:
 
 ```sshconfig
-Host my-workstation
-    HostName 10.0.0.5
-    # hpc-mcp: policy=off          # a machine you own and administer yourself
+Host shared-cluster
+    # hpc-mcp: policy=permissive   # block tier becomes a confirmation
 
 Host *
     # hpc-mcp: policy=strict       # the default, stated explicitly
 ```
+
+For a machine that is not an HPC system at all, say so instead of loosening the policy: `# hpc-mcp: hpc=false` turns the whole thing off for that host, which is what it is for.
 
 or for a single session, by launching the server with an environment variable:
 
@@ -308,7 +311,7 @@ or for a single session, by launching the server with an environment variable:
 |---|---|
 | `strict` | Default. The block tier is refused outright. |
 | `permissive` | The block tier becomes a confirmation: the agent must ask you, then pass `confirm_destructive=true`. |
-| `off` | No policy checks at all. Reasonable on your own workstation, not on a shared cluster. |
+| `off` | No policy checks at all. This is what `hpc=false` selects. |
 
 A refusal in strict mode tells you these options, so you never have to come back here to find them. `permissive` is the useful middle ground on a cluster: nothing is silently prevented, and nothing dangerous happens without you saying yes.
 
@@ -326,18 +329,29 @@ Host derecho
     # hpc-mcp: center=ncar role=login account=UABC0001 scratch=/glade/derecho/scratch/$USER
 ```
 
-`ssh` ignores the comment; this server reads it. Every key is optional, and with no annotation at all the server probes for the scheduler and treats the host as a login node.
+`ssh` ignores the comment; this server reads it. Every key is optional, and with no annotation at all the server probes for the scheduler and treats the host as an HPC login node, which is the cautious reading.
 
 | Key | Values | Effect |
 |---|---|---|
+| `hpc` | `false` | This host is not a shared HPC system. Login-node etiquette and the whole [command policy](#command-policy) stop applying. |
 | `center` | `ncar`, `curc` | Selects PBS or Slurm without probing the host. |
-| `role` | `login`, `data-access`, `compute`, `workstation` | Sets the [command policy](#command-policy) tier. `data-access` allows transfers while still routing compute away; `workstation` lifts login-node routing on a machine you own. |
+| `role` | `login`, `data-access`, `compute` | Sets the command policy tier. `data-access` allows transfers while still routing compute away. |
 | `account` | project code | Default `-A` / `--account` for `run_on_compute` and `submit_job`. |
 | `scratch` | path | Suggested as `remote_dir` when `submit_job` is called without one. |
 | `globus` | collection UUID | Lets Globus tools name this SSH alias instead of a UUID. |
 | `policy` | `strict`, `permissive`, `off` | See [when you really do want to run a blocked command](#when-you-really-do-want-to-run-a-blocked-command). |
 
 Put several on one line or use several comment lines, whichever reads better. A `Host *` block sets a default for every host, and a specific block wins over it, exactly as SSH resolves its own options.
+
+### Letting the agent fill this in
+
+You do not have to write these by hand. The first time a tool touches a host with no annotation, the result carries a one-line notice, and the agent can offer to sort it out:
+
+1. `probe_host` connects and reports what it finds: the scheduler, which of the known HPC filesystems are mounted, any project code in the environment, and whether the Globus CLI is installed. It proposes an annotation and lists what it cannot detect.
+2. The agent asks you the rest. Whether this really is a shared HPC system, which project code jobs should charge, and which policy level you want. It is told not to choose the policy for you.
+3. `annotate_host` writes your answers into the Host block. It backs the file up alongside it first, replaces any previous annotation, and touches nothing outside that one block.
+
+A `Host` block for the alias must already exist, since that is how you connect in the first place. Nothing is written until you have answered, and the notice is a nudge, not a gate: an unannotated host keeps working.
 
 ## Globus transfers
 
@@ -383,9 +397,14 @@ The unit suite mocks `subprocess.run`. The live suite exists because several rea
 
 ## Version
 
-1.5.0
+1.6.0
 
 ## Changelog
+
+### 1.6.0
+
+- **The agent can set a host up for you.** `probe_host` detects the scheduler, HPC filesystems, default account and Globus CLI, proposes an annotation, and lists what only you can answer. `annotate_host` writes the answers into `~/.ssh/config` after you confirm, keeping a backup and touching only that Host block. The first tool call against an unannotated host says so once.
+- **`hpc=false` replaces the `workstation` role.** A machine that is not a shared HPC system is not a kind of HPC node, so it is now stated directly, and it lifts login-node etiquette and the command policy together. Roles are `login`, `data-access` and `compute`.
 
 ### 1.5.0
 
