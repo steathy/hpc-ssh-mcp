@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 
@@ -89,6 +90,12 @@ _OPENSSH_VERSION_RE = re.compile(r"OpenSSH_(\d+)\.(\d+)")
 # (no remote shell), so it must NOT be shell-quoted. Older scp runs a remote
 # shell, so the path MUST be quoted. None = not yet probed.
 _SCP_SFTP_MODE: bool | None = None
+
+# FastMCP runs sync tools on worker threads and the MCP server handles requests
+# concurrently. This guards the two read-modify-writes: the settings store in
+# record_host and the scheduler-poll cache. It is never held across an SSH
+# round trip, so tools for different hosts do not queue behind one another.
+_STATE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -639,19 +646,21 @@ def _cached_poll(key: tuple, produce) -> str:
     limiting -- so the obvious reading was that the fix had not worked.
     """
     now = time.monotonic()
-    for stale in [k for k, (ts, _) in _POLL_CACHE.items()
-                  if now - ts >= SCHEDULER_POLL_INTERVAL]:
-        del _POLL_CACHE[stale]  # an expired answer is dead weight, not a cache
-    hit = _POLL_CACHE.get(key)
+    with _STATE_LOCK:
+        for stale in [k for k, (ts, _) in _POLL_CACHE.items()
+                      if now - ts >= SCHEDULER_POLL_INTERVAL]:
+            del _POLL_CACHE[stale]  # an expired answer is dead weight, not a cache
+        hit = _POLL_CACHE.get(key)
     if hit and now - hit[0] < SCHEDULER_POLL_INTERVAL:
         age = int(now - hit[0])
         return (
             f"{hit[1]}\n[cached {age}s ago; scheduler queries are rate-limited to one per "
             f"{SCHEDULER_POLL_INTERVAL}s per host. Wait before polling again.]"
         )
-    succeeded, result = produce()
+    succeeded, result = produce()  # the SSH round trip, outside the lock
     if succeeded:
-        _POLL_CACHE[key] = (now, result)
+        with _STATE_LOCK:
+            _POLL_CACHE[key] = (now, result)
     return result
 
 
@@ -2179,36 +2188,37 @@ def record_host(
         if role:
             pairs["role"] = _ROLE_ALIASES.get(role, role)
 
-    entries, read_error = _read_store_file()
-    if read_error:
-        return (
-            f"{read_error}\n"
-            "Refusing to rewrite it, because that would discard whatever it holds. "
-            "Ask the user to fix or delete the file, then try again."
-        )
-    # Merge, rather than replace the host's entry. Replacing was the behaviour
-    # in every storage format this server has had, but a partial update -- the
-    # natural call once a host is already described -- must not drop what it
-    # does not mention. `is_hpc` is a tri-state for the same reason: True cannot
-    # be the default, or every partial update would assert "this is an HPC
-    # system" and revert a recorded hpc=false. An explicit True removes that key
-    # (HPC is the default reading); None leaves it alone. Unsetting anything
-    # else stays a hand-edit of the file, which _STORE_NOTE invites.
-    existing = entries.get(host, {})
-    merged = dict(existing)
-    merged.update(pairs)
-    if is_hpc is True:
-        merged.pop("hpc", None)
-    if not pairs and merged == existing:
-        return (
-            f"Nothing to write for {host!r}. Pass at least one of is_hpc, center, role, "
-            "account, scratch, globus or policy."
-        )
-    entries = dict(entries)
-    entries[host] = merged
-    error = _write_store(entries)
-    if error:
-        return error
+    with _STATE_LOCK:  # read-merge-write: two concurrent calls lost one host without it
+        entries, read_error = _read_store_file()
+        if read_error:
+            return (
+                f"{read_error}\n"
+                "Refusing to rewrite it, because that would discard whatever it holds. "
+                "Ask the user to fix or delete the file, then try again."
+            )
+        # Merge, rather than replace the host's entry. Replacing was the behaviour
+        # in every storage format this server has had, but a partial update -- the
+        # natural call once a host is already described -- must not drop what it
+        # does not mention. `is_hpc` is a tri-state for the same reason: True cannot
+        # be the default, or every partial update would assert "this is an HPC
+        # system" and revert a recorded hpc=false. An explicit True removes that key
+        # (HPC is the default reading); None leaves it alone. Unsetting anything
+        # else stays a hand-edit of the file, which _STORE_NOTE invites.
+        existing = entries.get(host, {})
+        merged = dict(existing)
+        merged.update(pairs)
+        if is_hpc is True:
+            merged.pop("hpc", None)
+        if not pairs and merged == existing:
+            return (
+                f"Nothing to write for {host!r}. Pass at least one of is_hpc, center, role, "
+                "account, scratch, globus or policy."
+            )
+        entries = dict(entries)
+        entries[host] = merged
+        error = _write_store(entries)
+        if error:
+            return error
 
     _ONBOARDING_SEEN.add(host)
     _SCHEDULER_CACHE.pop(host, None)

@@ -336,3 +336,66 @@ class TestScpResultsMatchTheOutcome:
             returncode=1, stderr="scp: /data/model.nc: No such file or directory")
         result = ssh_hpc_server.scp_download_file("derecho", "/data/model.nc", str(dest))
         assert "Partial" not in result and "overwritten" not in result, result
+
+
+# ---------------------------------------------------------------------------
+# F9: shared state is written under a lock, and SSH round trips are not
+# ---------------------------------------------------------------------------
+# FastMCP runs sync tools on worker threads and the MCP server handles requests
+# concurrently. record_host is a read-modify-write of the store file, and two
+# concurrent calls for different hosts lost one of them (reproduced). The poll
+# cache is a dict that one thread iterated while another inserted. One lock,
+# held for the store's read-merge-write and for the cache's bookkeeping, and
+# deliberately *not* while a scheduler query is in flight: polls for different
+# hosts must not queue behind each other's SSH round trips.
+
+import threading
+
+
+class TestSharedStateIsLocked:
+    def test_two_concurrent_records_both_land(self, store, monkeypatch):
+        import time
+        real_write = ssh_hpc_server._write_store
+        def slow_write(document):
+            time.sleep(0.15)          # long enough for the other thread to have read
+            return real_write(document)
+        monkeypatch.setattr(ssh_hpc_server, "_write_store", slow_write)
+        threads = [
+            threading.Thread(target=ssh_hpc_server.record_host, args=("derecho",), kwargs={"center": "ncar"}),
+            threading.Thread(target=ssh_hpc_server.record_host, args=("alpine",), kwargs={"center": "curc"}),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(json.loads(store.read_text())["hosts"]) == ["alpine", "derecho"]
+
+    def test_the_store_is_written_under_the_lock(self, store, monkeypatch):
+        seen = []
+        real_write = ssh_hpc_server._write_store
+        def observing_write(document):
+            seen.append(ssh_hpc_server._STATE_LOCK.locked())
+            return real_write(document)
+        monkeypatch.setattr(ssh_hpc_server, "_write_store", observing_write)
+        ssh_hpc_server.record_host("derecho", center="ncar")
+        assert seen == [True]
+
+    def test_a_scheduler_query_runs_outside_the_lock(self):
+        held = []
+        def produce():
+            held.append(ssh_hpc_server._STATE_LOCK.locked())
+            return True, "answer"
+        ssh_hpc_server._POLL_CACHE.clear()
+        assert ssh_hpc_server._cached_poll(("queue", "h", "q"), produce) == "answer"
+        assert held == [False]
+
+    def test_the_cache_still_replays_and_expires(self, monkeypatch):
+        ssh_hpc_server._POLL_CACHE.clear()
+        calls = []
+        def produce():
+            calls.append(1)
+            return True, "answer"
+        first = ssh_hpc_server._cached_poll(("queue", "h", "q"), produce)
+        second = ssh_hpc_server._cached_poll(("queue", "h", "q"), produce)
+        assert first == "answer" and second.startswith("answer\n[cached")
+        assert len(calls) == 1
