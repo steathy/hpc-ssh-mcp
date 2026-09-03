@@ -53,3 +53,52 @@ class TestTheStoreIsReadNotCached:
 
     def test_there_is_no_store_cache_to_go_stale(self):
         assert not hasattr(ssh_hpc_server, "_STORE_CACHE")
+
+
+# ---------------------------------------------------------------------------
+# F4: the scratch path the server suggests must be one submit_job can use
+# ---------------------------------------------------------------------------
+# probe_host proposed scratch=/glade/derecho/scratch/$USER and submit_job later
+# said "pass remote_dir=<that>". But remote_dir goes through _shell_path, which is
+# shlex.quote, so $USER was a literal directory name. Reproduced on a live host:
+# a directory called "$USER" was created. The probe runs on the host, so it can
+# simply report who the user is and the suggestion can be concrete.
+
+def _probe_output(**over):
+    fields = {
+        "hostname": "derecho1.hpc.ucar.edu", "scheduler": "qsub", "account": "UABC0001",
+        "filesystems": "/glade /glade/derecho/scratch", "globus": "yes", "user": "jdoe",
+    }
+    fields.update(over)
+    return "\n".join(f"{k}={v}" for k, v in fields.items()) + "\n"
+
+
+class TestSuggestedScratchIsConcrete:
+    def test_the_probe_asks_the_host_who_the_user_is(self):
+        assert "user=" in ssh_hpc_server._PROBE_SCRIPT
+        assert '"$USER"' in ssh_hpc_server._PROBE_SCRIPT
+
+    def test_ncar_scratch_names_the_user(self):
+        guess = ssh_hpc_server._infer_from_probe(
+            {"scheduler": "qsub", "filesystems": "/glade /glade/work", "user": "jdoe"})
+        assert guess["scratch"] == "/glade/derecho/scratch/jdoe"
+
+    def test_curc_scratch_names_the_user(self):
+        guess = ssh_hpc_server._infer_from_probe(
+            {"scheduler": "sbatch", "filesystems": "/scratch/alpine /pl/active", "user": "jdoe"})
+        assert guess["scratch"] == "/scratch/alpine/jdoe"
+
+    def test_no_user_means_no_guess_rather_than_a_placeholder(self):
+        guess = ssh_hpc_server._infer_from_probe({"scheduler": "qsub", "filesystems": "/glade"})
+        assert "scratch" not in guess
+
+    def test_probe_host_output_carries_no_dollar_variable(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout=_probe_output())
+        result = ssh_hpc_server.probe_host("newbox")
+        assert "$USER" not in result, result
+        assert "scratch='/glade/derecho/scratch/jdoe'" in result, result
+
+    def test_the_suggested_value_survives_shell_quoting_unchanged(self):
+        """What submit_job will run: the quoted path must still be the path."""
+        quoted = ssh_hpc_server._shell_path("/glade/derecho/scratch/jdoe")
+        assert quoted.strip("'") == "/glade/derecho/scratch/jdoe"

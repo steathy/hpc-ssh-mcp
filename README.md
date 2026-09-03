@@ -326,7 +326,7 @@ A few things about a host cannot be discovered from the host itself, or are too 
       "center": "ncar",
       "role": "login",
       "account": "UABC0001",
-      "scratch": "/glade/derecho/scratch/$USER"
+      "scratch": "/glade/derecho/scratch/jdoe"
     },
     "laptop": { "hpc": false }
   }

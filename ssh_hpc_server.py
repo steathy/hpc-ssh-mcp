@@ -1887,6 +1887,7 @@ _ONBOARDING_SEEN: set[str] = set()
 
 _PROBE_SCRIPT = r"""
 printf 'hostname=%s\n' "$(hostname -f 2>/dev/null || hostname)"
+printf 'user=%s\n' "$USER"
 s=""
 command -v qsub   >/dev/null 2>&1 && s="qsub"
 command -v sbatch >/dev/null 2>&1 && s="${s:+$s }sbatch"
@@ -1950,10 +1951,13 @@ def _infer_from_probe(fields: dict) -> dict:
 
     if fields.get("account"):
         suggestion["account"] = fields["account"]
-    if suggestion.get("center") == "ncar":
-        suggestion["scratch"] = "/glade/derecho/scratch/$USER"
-    elif suggestion.get("center") == "curc":
-        suggestion["scratch"] = "/scratch/alpine/$USER"
+    # A concrete path, not "$USER": the value is recorded verbatim and submit_job
+    # shell-quotes it, so a variable in it would name a literal directory.
+    user = fields.get("user", "")
+    if suggestion.get("center") == "ncar" and user:
+        suggestion["scratch"] = f"/glade/derecho/scratch/{user}"
+    elif suggestion.get("center") == "curc" and user:
+        suggestion["scratch"] = f"/scratch/alpine/{user}"
     suggestion["is_hpc"] = bool(scheduler or filesystems)
     return suggestion
 
