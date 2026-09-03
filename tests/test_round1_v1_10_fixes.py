@@ -399,3 +399,30 @@ class TestSharedStateIsLocked:
         second = ssh_hpc_server._cached_poll(("queue", "h", "q"), produce)
         assert first == "answer" and second.startswith("answer\n[cached")
         assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# F11: a generic mount alone does not make a host HPC
+# ---------------------------------------------------------------------------
+# /projects exists on plenty of ordinary Linux machines. With it and no
+# scheduler the probe declared the host HPC, inferred no centre and no role, and
+# printed an empty "Suggested settings" followed by `record_host(host='box', )`.
+
+class TestProbeNeedsMoreThanAGenericMount:
+    def test_a_bare_projects_mount_is_not_hpc(self):
+        guess = ssh_hpc_server._infer_from_probe({"scheduler": "", "filesystems": "/projects", "hostname": "box"})
+        assert guess["is_hpc"] is False
+
+    def test_a_centre_mount_is(self):
+        guess = ssh_hpc_server._infer_from_probe({"scheduler": "", "filesystems": "/scratch/alpine /projects"})
+        assert guess["is_hpc"] is True and guess["center"] == "curc"
+
+    def test_a_scheduler_is(self):
+        assert ssh_hpc_server._infer_from_probe({"scheduler": "qsub", "filesystems": ""})["is_hpc"] is True
+
+    def test_the_probe_asks_rather_than_proposing_nothing(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=0, stdout=_probe_output(scheduler="", filesystems="/projects", account="", globus="no"))
+        result = ssh_hpc_server.probe_host("box")
+        assert "record_host(host='box', )" not in result, result
+        assert "does not look like a shared HPC system" in result, result

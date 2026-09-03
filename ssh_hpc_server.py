@@ -2018,7 +2018,10 @@ def _infer_from_probe(fields: dict) -> dict:
         suggestion["scratch"] = f"/glade/derecho/scratch/{user}"
     elif suggestion.get("center") == "curc" and user:
         suggestion["scratch"] = f"/scratch/alpine/{user}"
-    suggestion["is_hpc"] = bool(scheduler or filesystems)
+    # A scheduler or a centre's own mount. /projects alone is not evidence: plenty
+    # of ordinary machines have one, and with nothing else inferred the proposal
+    # would be empty.
+    suggestion["is_hpc"] = bool(scheduler) or "center" in suggestion
     return suggestion
 
 
