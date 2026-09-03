@@ -21,7 +21,7 @@ import uuid
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
@@ -371,13 +371,12 @@ def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT)
 # symlink or a downgraded file mode would cost them far more than the
 # convenience is worth. This file is ours: deleting it loses nothing but the
 # defaults, and a hand-written annotation in ~/.ssh/config always wins over it.
-DEFAULT_STORE = "~/.config/hpc-ssh-mcp/hosts.conf"
+DEFAULT_STORE = "~/.config/hpc-ssh-mcp/hosts.json"
 STORE_ENV_VAR = "HPC_SSH_MCP_STORE"
-_STORE_HEADER = (
-    "# Host settings written by hpc-ssh-mcp (annotate_host).\n"
-    "# One host per line:  <ssh alias>: key=value key=value\n"
-    "# Safe to edit or delete; a deleted host simply falls back to safe defaults.\n"
-    "# A `# hpc-mcp:` comment in ~/.ssh/config takes precedence over anything here.\n"
+_STORE_NOTE = (
+    "Host settings written by hpc-ssh-mcp (annotate_host). Safe to edit or delete: "
+    "a removed host simply falls back to safe defaults. A `# hpc-mcp:` comment in "
+    "~/.ssh/config takes precedence over anything here."
 )
 
 
@@ -385,7 +384,7 @@ _ANNOTATION_KEYS = ("hpc", "center", "role", "account", "scratch", "globus", "po
 
 
 def _format_annotation(pairs: dict) -> str:
-    """key=value pairs in a stable, readable order."""
+    """key=value pairs in a stable, readable order, for messages to the user."""
     order = {key: i for i, key in enumerate(_ANNOTATION_KEYS)}
     return " ".join(f"{k}={pairs[k]}" for k in sorted(pairs, key=lambda k: order.get(k, 99)))
 
@@ -394,45 +393,55 @@ def _store_path() -> str:
     return os.path.expanduser(os.environ.get(STORE_ENV_VAR) or DEFAULT_STORE)
 
 
-def _load_store() -> dict:
-    """Read the managed store. Any problem with it means 'no entries'."""
+def _read_store_file() -> tuple[dict, str | None]:
+    """Return (entries, error). An absent file is not an error; a broken one is.
+
+    Distinguishing the two matters on the write path: rewriting a file we
+    could not read would silently discard whatever it held.
+    """
+    path = _store_path()
     try:
-        with open(_store_path(), encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return {}
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, UnicodeDecodeError) as exc:
+        return {}, f"Could not read {path}: {exc}"
+    except json.JSONDecodeError as exc:
+        return {}, f"Could not parse {path} as JSON: {exc}"
+    if not isinstance(raw, dict) or not isinstance(raw.get("hosts", {}), dict):
+        return {}, f"Could not use {path}: expected a JSON object with a 'hosts' object."
+
     entries: dict = {}
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
+    for host, directives in raw.get("hosts", {}).items():
+        if not isinstance(directives, dict) or not _VALID_HOST_RE.match(str(host)):
             continue
-        host, sep, body = line.partition(":")
-        host = host.strip()
-        if not sep or not host or not _VALID_HOST_RE.match(host):
-            continue
-        directives = {}
-        for token in body.split():
-            key, has, value = token.partition("=")
-            if has and key and value:
-                directives[key.strip().lower()] = value.strip()
-        if directives:
-            entries[host] = directives
-    return entries
+        # Values are written as scalars; anything else is not something we wrote.
+        clean = {
+            str(k).lower(): v for k, v in directives.items()
+            if isinstance(v, (str, bool, int, float))
+        }
+        if clean:
+            entries[str(host)] = clean
+    return entries, None
+
+
+def _load_store() -> dict:
+    """Entries from the managed store. Any problem with it means 'no entries'."""
+    return _read_store_file()[0]
 
 
 def _write_store(entries: dict) -> str | None:
     """Replace the store atomically and privately. Returns an error, or None."""
     path = _store_path()
-    body = "".join(
-        f"{host}: " + _format_annotation(directives) + "\n"
-        for host, directives in sorted(entries.items())
-    )
+    document = {"_note": _STORE_NOTE, "hosts": dict(sorted(entries.items()))}
     try:
         os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
         temp = f"{path}.tmp"
         handle = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(handle, "w", encoding="utf-8") as fh:
-            fh.write(_STORE_HEADER + body)
+            json.dump(document, fh, indent=2, sort_keys=False)
+            fh.write("\n")
         os.replace(temp, path)
     except OSError as exc:
         return f"Could not write {path}: {exc}"
@@ -1518,16 +1527,19 @@ def _globus_env() -> dict:
 
 
 def _globus_collections() -> dict:
-    """SSH alias -> collection UUID, from `# hpc-mcp: globus=<uuid>` annotations."""
+    """SSH alias -> collection UUID, from either place a host can be described."""
     if _DIRECTIVE_CACHE is None:
-        _host_directives("")  # populate the cache
+        _host_directives("")  # populate both caches
     found = {}
     for patterns, directives in _DIRECTIVE_CACHE or []:
         uuid_ = directives.get("globus")
         if uuid_:
             for pattern in patterns:
                 if "*" not in pattern and "?" not in pattern:
-                    found.setdefault(pattern, uuid_)
+                    found.setdefault(pattern, str(uuid_))
+    for host, directives in (_STORE_CACHE or {}).items():
+        if directives.get("globus"):
+            found.setdefault(host, str(directives["globus"]))
     return found
 
 
@@ -2091,7 +2103,7 @@ def annotate_host(
 
     if not is_hpc:
         # Nothing about schedulers, accounts or filesystems applies off an HPC system.
-        pairs = {"hpc": "false"}
+        pairs = {"hpc": False}
         if policy:
             pairs["policy"] = policy
     else:
@@ -2109,7 +2121,14 @@ def annotate_host(
     known_by_ssh = _ssh_config_knows(host)
     overridden = sorted(set(pairs) & set(_ssh_config_annotations(host)))
 
-    entries = dict(_load_store())
+    entries, read_error = _read_store_file()
+    if read_error:
+        return (
+            f"{read_error}\n"
+            "Refusing to rewrite it, because that would discard whatever it holds. "
+            "Ask the user to fix or delete the file, then try again."
+        )
+    entries = dict(entries)
     entries[host] = pairs
     error = _write_store(entries)
     if error:

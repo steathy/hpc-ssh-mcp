@@ -220,7 +220,7 @@ Every product above accepts an `env` object beside `command` and `args`. In Code
 "env": {
   "HPC_SSH_MCP_POLICY": "strict",
   "HPC_SSH_MCP_SSH_CONFIG": "/home/you/.ssh/config",
-  "HPC_SSH_MCP_STORE": "/home/you/.config/hpc-ssh-mcp/hosts.conf"
+  "HPC_SSH_MCP_STORE": "/home/you/.config/hpc-ssh-mcp/hosts.json"
 }
 ```
 
@@ -332,7 +332,7 @@ Host derecho
 
 `ssh` ignores the comment; this server reads it and never writes to it. Every key is optional, and with no annotation at all the server probes for the scheduler and treats the host as an HPC login node, which is the cautious reading.
 
-There are two places these settings can come from: this comment, written by you, and `~/.config/hpc-ssh-mcp/hosts.conf`, written by [`annotate_host`](#letting-the-agent-fill-this-in). Yours wins, key by key.
+There are two places these settings can come from: this comment, written by you, and `~/.config/hpc-ssh-mcp/hosts.json`, written by [`annotate_host`](#letting-the-agent-fill-this-in). Yours wins, key by key.
 
 | Key | Values | Effect |
 |---|---|---|
@@ -356,14 +356,18 @@ You do not have to write these by hand. The first time a tool touches a host wit
 
 **It does not write to `~/.ssh/config`, and nothing here ever will.** That file controls access to every host you have. A mangled line, a replaced symlink from a dotfile manager, or a downgraded file mode would cost you far more than the convenience is worth, so the server reads it and leaves it alone.
 
-Answers go to a small file the server owns, `~/.config/hpc-ssh-mcp/hosts.conf` (set `HPC_SSH_MCP_STORE` to move it), one line per host:
+Answers go to a small JSON file the server owns, `~/.config/hpc-ssh-mcp/hosts.json` (set `HPC_SSH_MCP_STORE` to move it):
 
-```
-derecho: center=ncar role=login account=UABC0001
-laptop: hpc=false
+```json
+{
+  "hosts": {
+    "derecho": { "center": "ncar", "role": "login", "account": "UABC0001" },
+    "laptop": { "hpc": false }
+  }
+}
 ```
 
-Delete it, edit it, or check it into nothing at all: the worst case is that hosts fall back to safe defaults. And a `# hpc-mcp:` comment you write by hand in `~/.ssh/config` always beats it, so your own statement is never overridden by something a tool decided.
+Delete it, edit it, or check it into nothing at all: the worst case is that hosts fall back to safe defaults. If it ever becomes unreadable, the server says so and refuses to rewrite it rather than discarding what it held. And a `# hpc-mcp:` comment you write by hand in `~/.ssh/config` always beats it, so your own statement is never overridden by something a tool decided.
 
 Nothing is written until you have answered, and the notice is a nudge rather than a gate: an unannotated host keeps working.
 
@@ -411,9 +415,15 @@ The unit suite mocks `subprocess.run`. The live suite exists because several rea
 
 ## Version
 
-1.7.0
+1.8.0
 
 ## Changelog
+
+### 1.8.0
+
+- **The settings file is JSON**, at `~/.config/hpc-ssh-mcp/hosts.json`. It is machine-written and machine-read, so it uses a format with a parser that already exists instead of a line syntax invented here. `hpc` is a real boolean. Hand-written annotations stay in `~/.ssh/config`, and still win.
+- **A store that cannot be parsed is no longer silently overwritten.** `annotate_host` reports the problem and refuses, rather than discarding whatever the file held.
+- **Fixed: a Globus UUID recorded by `annotate_host` was write-only.** Collection aliases only looked at `~/.ssh/config`, so a UUID in the store could never be resolved.
 
 ### 1.7.0
 

@@ -174,7 +174,7 @@ class TestLiveOnboarding:
         cfg = tmp_path / "config"
         cfg.write_text(f"Host {HOST}\n    HostName {HOST}\n    ControlMaster auto\n")
         monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(cfg))
-        monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "hosts.conf"))
+        monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "hosts.json"))
         ssh_hpc_server._DIRECTIVE_CACHE = None
         ssh_hpc_server._ONBOARDING_SEEN.clear()
         yield cfg
@@ -188,9 +188,11 @@ class TestLiveOnboarding:
         assert "annotate_host" in out or "is_hpc=False" in out
 
     def test_annotate_round_trip(self, scratch_config, tmp_path):
+        import json
         before = scratch_config.read_bytes()
         assert "Recorded" in annotate_host(HOST, is_hpc=False)
-        assert f"{HOST}: hpc=false" in (tmp_path / "hosts.conf").read_text()
+        stored = json.loads((tmp_path / "hosts.json").read_text())
+        assert stored["hosts"][HOST]["hpc"] is False
         assert scratch_config.read_bytes() == before  # ssh config untouched
         assert ssh_hpc_server._is_hpc(HOST) is False
         assert ssh_hpc_server._policy_mode(HOST) == "off"

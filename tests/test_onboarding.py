@@ -50,7 +50,7 @@ Host *
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
-    path = tmp_path / "store" / "hosts.conf"
+    path = tmp_path / "store" / "hosts.json"
     path.parent.mkdir()
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
     ssh_hpc_server._DIRECTIVE_CACHE = None
@@ -260,7 +260,10 @@ class TestAnnotateHostStore:
         result = annotate_host("newbox", center="ncar", role="login", account="UABC0001")
         assert "newbox" in result
         assert str(store) in result
-        assert "newbox: center=ncar role=login account=UABC0001" in store.read_text()
+        assert store.exists()
+        assert _host_directives("newbox") == {
+            "center": "ncar", "role": "login", "account": "UABC0001",
+        }
 
     def test_the_server_reads_it_back_immediately(self, ssh_config, store):
         annotate_host("newbox", center="curc", role="login")
@@ -279,24 +282,19 @@ class TestAnnotateHostStore:
 
     def test_store_explains_itself(self, ssh_config, store):
         annotate_host("newbox", center="ncar")
-        header = store.read_text().splitlines()[0]
-        assert header.startswith("#")
         assert "delete" in store.read_text().lower()
 
     def test_replaces_an_earlier_entry_for_the_same_host(self, ssh_config, store):
         annotate_host("newbox", center="ncar", account="OLD001")
         annotate_host("newbox", center="ncar", account="NEW002")
-        text = store.read_text()
-        assert "OLD001" not in text
-        assert "NEW002" in text
-        assert len([l for l in text.splitlines() if l.startswith("newbox:")]) == 1
+        assert _host_directives("newbox")["account"] == "NEW002"
+        assert "OLD001" not in store.read_text()
 
     def test_other_entries_survive(self, ssh_config, store):
         annotate_host("newbox", center="ncar")
         annotate_host("plainer", center="curc")
-        text = store.read_text()
-        assert "newbox: center=ncar" in text
-        assert "plainer: center=curc" in text
+        assert _host_directives("newbox")["center"] == "ncar"
+        assert _host_directives("plainer")["center"] == "curc"
 
     def test_deleting_the_store_restores_defaults(self, ssh_config, store):
         annotate_host("newbox", center="curc")
@@ -312,14 +310,11 @@ class TestAnnotateHostStore:
 
     def test_hpc_false_is_written(self, ssh_config, store):
         annotate_host("newbox", is_hpc=False)
-        assert "newbox: hpc=false" in store.read_text()
         assert _is_hpc("newbox") is False
 
     def test_hpc_false_drops_hpc_only_keys(self, ssh_config, store):
         annotate_host("newbox", is_hpc=False, center="ncar", account="X1")
-        line = [l for l in store.read_text().splitlines() if l.startswith("newbox:")][0]
-        assert "center" not in line
-        assert "account" not in line
+        assert set(_host_directives("newbox")) == {"hpc"}
 
 
 class TestAnnotateHostPrecedence:
