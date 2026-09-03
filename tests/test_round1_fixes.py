@@ -216,9 +216,7 @@ class TestOnlySuccessIsCached:
 def store(tmp_path, monkeypatch):
     path = tmp_path / "hosts.json"
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
-    ssh_hpc_server._STORE_CACHE = None
     yield path
-    ssh_hpc_server._STORE_CACHE = None
 
 
 GLADE = "d33b3614-6d04-11e5-ba46-22000b92c6ec"
@@ -485,7 +483,6 @@ class TestStoreWriteHasNoFixedTempName:
     def test_the_store_is_still_written_privately_and_atomically(self, tmp_path, monkeypatch):
         target = tmp_path / "nested" / "hosts.json"
         monkeypatch.setenv("HPC_SSH_MCP_STORE", str(target))
-        ssh_hpc_server._STORE_CACHE = None
         assert ssh_hpc_server._write_store({"h": {"center": "ncar"}}) is None
         assert oct(target.stat().st_mode)[-3:] == "600"
         assert [p.name for p in target.parent.iterdir()] == ["hosts.json"]

@@ -232,10 +232,8 @@ class TestLiveOnboarding:
         real_config = os.path.expanduser("~/.ssh/config")
         before = open(real_config, "rb").read() if os.path.exists(real_config) else None
         monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "hosts.json"))
-        ssh_hpc_server._STORE_CACHE = None
         ssh_hpc_server._ONBOARDING_SEEN.clear()
         yield tmp_path / "hosts.json"
-        ssh_hpc_server._STORE_CACHE = None
         ssh_hpc_server._ONBOARDING_SEEN.clear()
         after = open(real_config, "rb").read() if os.path.exists(real_config) else None
         assert after == before, "~/.ssh/config was modified by a live test"

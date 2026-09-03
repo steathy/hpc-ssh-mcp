@@ -9,12 +9,10 @@ def isolate_host_store(tmp_path, monkeypatch):
     """No test may read or write the developer's real host store."""
     import ssh_hpc_server
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "isolated-hosts.json"))
-    ssh_hpc_server._STORE_CACHE = None
     # Leaking this made any assertion on tool output depend on test order: the
     # first-use notice appears once per host per *process*, not per test.
     ssh_hpc_server._ONBOARDING_SEEN.clear()
     yield
-    ssh_hpc_server._STORE_CACHE = None
     ssh_hpc_server._ONBOARDING_SEEN.clear()
 
 
@@ -30,7 +28,6 @@ def mock_subprocess():
     ssh_hpc_server._SCP_SFTP_MODE = False
     ssh_hpc_server._SCHEDULER_CACHE.clear()
     ssh_hpc_server._POLL_CACHE.clear()
-    ssh_hpc_server._STORE_CACHE = None
     try:
         with patch("ssh_hpc_server.subprocess.run") as mock_run:
             yield mock_run
@@ -38,7 +35,6 @@ def mock_subprocess():
         ssh_hpc_server._SCP_SFTP_MODE = None
         ssh_hpc_server._SCHEDULER_CACHE.clear()
         ssh_hpc_server._POLL_CACHE.clear()
-        ssh_hpc_server._STORE_CACHE = None
 
 
 def make_completed_process(returncode=0, stdout="", stderr=""):

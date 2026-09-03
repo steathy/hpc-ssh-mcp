@@ -26,9 +26,7 @@ GLADE = "d33b3614-6d04-11e5-ba46-22000b92c6ec"
 def store(tmp_path, monkeypatch):
     path = tmp_path / "hosts.json"
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
-    ssh_hpc_server._STORE_CACHE = None
     yield path
-    ssh_hpc_server._STORE_CACHE = None
 
 
 def payload(store):
@@ -108,7 +106,6 @@ class TestRoundTrip:
 class TestBadInput:
     def _write(self, store, text):
         store.write_text(text)
-        ssh_hpc_server._STORE_CACHE = None
 
     def test_missing_file(self, store):
         assert _load_store() == {}
@@ -163,7 +160,6 @@ class TestTheStoreIsTheOnlySource:
             "Host derecho\n    # hpc-mcp: center=ncar role=compute\n"
         )
         monkeypatch.setenv("HOME", str(home))
-        ssh_hpc_server._STORE_CACHE = None
         record_host("derecho", center="curc", role="login")
         assert _host_settings("derecho")["center"] == "curc"
         assert _host_settings("derecho")["role"] == "login"

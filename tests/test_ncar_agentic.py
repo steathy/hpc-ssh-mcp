@@ -88,7 +88,6 @@ class TestSharedRootTraversal:
         cfg.write_text(json.dumps({"hosts": {"box": {"hpc": False}}}))
         monkeypatch.setenv("HPC_SSH_MCP_STORE", str(cfg))
         monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-        ssh_hpc_server._STORE_CACHE = None
         assert ssh_hpc_server._policy_mode("box") == "off"
 
 
@@ -138,9 +137,7 @@ def policy_profiles(tmp_path, monkeypatch):
     path.write_text(json.dumps({"hosts": POLICY_SETTINGS}))
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
     monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-    ssh_hpc_server._STORE_CACHE = None
     yield path
-    ssh_hpc_server._STORE_CACHE = None
 
 
 class TestPolicyMode:
@@ -162,7 +159,6 @@ class TestPolicyMode:
     def test_no_settings_at_all_is_strict(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "absent.json"))
         monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-        ssh_hpc_server._STORE_CACHE = None
         assert _policy_mode("anything") == "strict"
 
 

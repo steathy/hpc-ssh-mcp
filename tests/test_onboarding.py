@@ -53,10 +53,8 @@ def store(tmp_path, monkeypatch):
     path.parent.mkdir()
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
     monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-    ssh_hpc_server._STORE_CACHE = None
     ssh_hpc_server._ONBOARDING_SEEN.clear()
     yield path
-    ssh_hpc_server._STORE_CACHE = None
     ssh_hpc_server._ONBOARDING_SEEN.clear()
 
 
@@ -64,7 +62,6 @@ def store(tmp_path, monkeypatch):
 def recorded(store):
     """derecho and laptop already recorded; newbox and plainer are unknown."""
     store.write_text(json.dumps({"hosts": BASE_SETTINGS}))
-    ssh_hpc_server._STORE_CACHE = None
     yield store
 
 
@@ -91,7 +88,6 @@ class TestHpcFalse:
     @pytest.mark.parametrize("value", ["false", "False", "no", "0", "off", False])
     def test_recognised_negatives(self, store, value):
         store.write_text(json.dumps({"hosts": {"box": {"hpc": value}}}))
-        ssh_hpc_server._STORE_CACHE = None
         assert _is_hpc("box") is False
 
     def test_non_hpc_host_lifts_the_policy(self, recorded, mock_subprocess):
@@ -107,7 +103,6 @@ class TestHpcFalse:
 
     def test_explicit_policy_beats_the_hpc_flag(self, store, mock_subprocess):
         store.write_text(json.dumps({"hosts": {"box": {"hpc": False, "policy": "strict"}}}))
-        ssh_hpc_server._STORE_CACHE = None
         assert _policy_mode("box") == "strict"
         assert "Blocked" in execute_remote_bash(host="box", command="sudo ls")
 
@@ -286,7 +281,6 @@ class TestRecordHostStore:
     def test_store_is_created_with_parent_directories(self, store, tmp_path, monkeypatch):
         target = tmp_path / "nested" / "deeper" / "hosts.json"
         monkeypatch.setenv("HPC_SSH_MCP_STORE", str(target))
-        ssh_hpc_server._STORE_CACHE = None
         record_host("newbox", center="ncar")
         assert target.exists()
 
@@ -316,12 +310,10 @@ class TestRecordHostStore:
         record_host("newbox", center="curc")
         assert _host_settings("newbox")["center"] == "curc"
         store.unlink()
-        ssh_hpc_server._STORE_CACHE = None
         assert _host_settings("newbox") == {}
 
     def test_a_corrupt_store_is_ignored_not_fatal(self, store):
         store.write_text("this is not: a valid = anything\n\x00garbage\n")
-        ssh_hpc_server._STORE_CACHE = None
         assert _host_settings("newbox") == {}
 
     def test_hpc_false_is_written(self, store):

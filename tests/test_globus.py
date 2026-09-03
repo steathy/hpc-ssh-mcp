@@ -44,9 +44,7 @@ def profiles(tmp_path, monkeypatch):
     path = tmp_path / "hosts.json"
     path.write_text(json.dumps({"hosts": COLLECTIONS}))
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
-    ssh_hpc_server._STORE_CACHE = None
     yield path
-    ssh_hpc_server._STORE_CACHE = None
 
 
 @pytest.fixture

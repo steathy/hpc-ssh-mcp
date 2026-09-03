@@ -68,9 +68,7 @@ def settings(tmp_path, monkeypatch):
     (home / ".ssh" / "config").write_text(SSH_CONFIG_WITH_ANNOTATIONS)
     monkeypatch.setenv("HOME", str(home))
 
-    ssh_hpc_server._STORE_CACHE = None
     yield path
-    ssh_hpc_server._STORE_CACHE = None
 
 
 class TestNothingReadsSshConfig:

@@ -517,21 +517,18 @@ CENTER_SCHEDULERS = {"ncar": "pbs", "curc": "slurm"}
 _ROLE_ALIASES = {"data-access": "dtn", "datamover": "dtn", "transfer": "dtn"}
 VALID_ROLES = ("login", "dtn", "compute")
 
-# {host: {key: value}} from the store. None = not yet loaded.
-_STORE_CACHE: dict | None = None
-
-
 def _host_settings(host: str) -> dict:
     """Settings recorded for a host, keyed by the exact SSH alias.
 
     No pattern matching: a host is described because the user described it, not
     because a wildcard happened to cover it. Anything wrong with the store
     means "nothing recorded", never an exception.
+
+    The file is read on every call, deliberately. It is a few hundred bytes next
+    to an SSH round trip, and every refusal tells the user to edit it and retry:
+    a cache made that instruction false until the server was restarted.
     """
-    global _STORE_CACHE
-    if _STORE_CACHE is None:
-        _STORE_CACHE = _load_store()
-    return dict(_STORE_CACHE.get(host, {}))
+    return dict(_load_store().get(host, {}))
 
 
 _FALSEY = {"false", "no", "0", "off", "n"}
@@ -1552,12 +1549,9 @@ def _globus_env() -> dict:
 
 def _globus_collections() -> dict:
     """SSH alias -> collection UUID, from the settings store."""
-    global _STORE_CACHE
-    if _STORE_CACHE is None:
-        _STORE_CACHE = _load_store()
     return {
         host: str(settings["globus"])
-        for host, settings in _STORE_CACHE.items() if settings.get("globus")
+        for host, settings in _load_store().items() if settings.get("globus")
     }
 
 
@@ -2157,8 +2151,6 @@ def record_host(
     if error:
         return error
 
-    global _STORE_CACHE
-    _STORE_CACHE = None
     _ONBOARDING_SEEN.add(host)
     _SCHEDULER_CACHE.pop(host, None)
 
