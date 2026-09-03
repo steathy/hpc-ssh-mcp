@@ -268,3 +268,71 @@ class TestHpcFalseCanBeUndone:
     def test_the_default_is_omitted(self):
         import inspect
         assert inspect.signature(ssh_hpc_server.record_host).parameters["is_hpc"].default is None
+
+
+# ---------------------------------------------------------------------------
+# F10: scp results describe what actually happened to the file
+# ---------------------------------------------------------------------------
+# scp_upload_file computed the "[N GB transferred over scp ...]" notice before the
+# transfer and appended it whatever the result, so a failed 3 GB upload was
+# reported as transferred. scp_download_file removed a partial file only for a
+# timeout into a new path; a dropped connection (rc 255) or an scp error (rc 1),
+# or any failure while overwriting, left a truncated file with no mention.
+
+@pytest.fixture
+def sparse_3g(tmp_path):
+    path = tmp_path / "sparse.bin"
+    with open(path, "wb") as fh:
+        fh.truncate(3_000_000_000)   # a sparse file: 3 GB by size, nothing on disk
+    return path
+
+
+class TestScpResultsMatchTheOutcome:
+    def test_a_failed_upload_is_not_called_transferred(self, mock_subprocess, sparse_3g):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=255, stderr="kex_exchange_identification: Connection closed by remote host")
+        result = ssh_hpc_server.scp_upload_file("derecho", str(sparse_3g), "/glade/x.bin")
+        assert "[EXIT CODE 255]" in result
+        assert "transferred over scp" not in result, result
+
+    def test_a_successful_upload_still_gets_the_globus_pointer(self, mock_subprocess, sparse_3g):
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        result = ssh_hpc_server.scp_upload_file("derecho", str(sparse_3g), "/glade/x.bin")
+        assert "3.0 GB transferred over scp" in result, result
+
+    def test_a_failed_download_into_a_new_path_is_removed(self, mock_subprocess, tmp_path):
+        dest = tmp_path / "model.nc"
+        def fail_leaving_a_partial(*args, **kwargs):
+            dest.write_bytes(b"half of the fi")
+            return make_completed_process(returncode=255, stderr="Connection closed by remote host")
+        mock_subprocess.side_effect = fail_leaving_a_partial
+        result = ssh_hpc_server.scp_download_file("derecho", "/data/model.nc", str(dest))
+        assert not dest.exists(), "the partial file was left behind"
+        assert "Partial download removed" in result, result
+
+    def test_a_failed_download_over_an_existing_file_says_it_was_damaged(self, mock_subprocess, tmp_path):
+        dest = tmp_path / "model.nc"
+        dest.write_bytes(b"the original, all of it")
+        def fail_after_overwriting(*args, **kwargs):
+            dest.write_bytes(b"new but tru")
+            return make_completed_process(returncode=1, stderr="scp: connection lost")
+        mock_subprocess.side_effect = fail_after_overwriting
+        result = ssh_hpc_server.scp_download_file("derecho", "/data/model.nc", str(dest))
+        assert dest.exists()   # we cannot restore it, so we must not delete it
+        assert "partially overwritten" in result, result
+
+    def test_a_failure_that_left_an_existing_file_untouched_does_not_alarm(self, mock_subprocess, tmp_path):
+        dest = tmp_path / "model.nc"
+        dest.write_bytes(b"the original")
+        mock_subprocess.return_value = make_completed_process(
+            returncode=1, stderr="scp: /data/model.nc: No such file or directory")
+        result = ssh_hpc_server.scp_download_file("derecho", "/data/model.nc", str(dest))
+        assert dest.read_bytes() == b"the original"
+        assert "overwritten" not in result, result
+
+    def test_a_failure_that_wrote_nothing_says_nothing_about_the_file(self, mock_subprocess, tmp_path):
+        dest = tmp_path / "model.nc"
+        mock_subprocess.return_value = make_completed_process(
+            returncode=1, stderr="scp: /data/model.nc: No such file or directory")
+        result = ssh_hpc_server.scp_download_file("derecho", "/data/model.nc", str(dest))
+        assert "Partial" not in result and "overwritten" not in result, result

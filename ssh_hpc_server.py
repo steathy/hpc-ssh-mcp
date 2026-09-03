@@ -383,6 +383,15 @@ def _run_ssh_script_checked(host: str, script: str, timeout: int = DEFAULT_TIMEO
     return _run_ssh_checked(host, BASH_STDIN, timeout=timeout, input_data=script)
 
 
+def _file_signature(path: str) -> tuple[int, int] | None:
+    """(size, mtime_ns) of a regular file, or None if there is no file there."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns) if os.path.isfile(path) else None
+
+
 def _large_transfer_notice(path: str) -> str:
     """Point at Globus/DTN for files scp should not be moving over a login node."""
     try:
@@ -1480,14 +1489,20 @@ def scp_download_file(
     _validate_host(host)
     _validate_timeout(timeout)
     local_abs = _local_path(local_path)
-    existed_before = os.path.exists(local_abs)
+    before = _file_signature(local_abs)
     rc, result = _run_scp(host, [_scp_remote_spec(host, remote_path), local_abs], timeout=timeout)
-    if rc == -1 and not existed_before and os.path.isfile(local_abs):
-        # A timed-out scp leaves a silently truncated destination behind.
+    if rc == 0:
+        return result + _large_transfer_notice(local_abs)
+    # scp writes the destination in place, so any failure -- a timeout, a dropped
+    # connection, an scp error part-way -- can leave it truncated.
+    if before is None and os.path.isfile(local_abs):
         os.remove(local_abs)
         result += f"\nPartial download removed: {local_abs}"
-    elif rc == 0:
-        result += _large_transfer_notice(local_abs)
+    elif before is not None and _file_signature(local_abs) != before:
+        result += (
+            f"\n{local_abs} existed before this call and has been partially overwritten. "
+            "It was not removed, because the original cannot be restored."
+        )
     return result
 
 
@@ -1513,11 +1528,11 @@ def scp_upload_file(
     local_abs = _local_path(local_path)
     if not os.path.exists(local_abs):
         return f"Local file not found: {local_abs}"
-    notice = _large_transfer_notice(local_abs)
-    _, result = _run_scp(
+    rc, result = _run_scp(
         host, [local_abs, _scp_remote_spec(host, remote_path)], timeout=timeout,
     )
-    return result + notice
+    # Only a transfer that happened is one to point at Globus for.
+    return result + (_large_transfer_notice(local_abs) if rc == 0 else "")
 
 
 @mcp.tool(annotations=_READ_ONLY)
