@@ -2114,11 +2114,13 @@ def probe_host(host: str) -> str:
 
 
 def _validate_setting(key: str, value: str) -> None:
-    """Values live in a single-line, space-separated comment, so keep them simple."""
-    if re.search(r"\s", value):
-        raise ValueError(f"Invalid {key}: {value!r} must not contain whitespace or newlines.")
-    if "#" in value:
-        raise ValueError(f"Invalid {key}: {value!r} must not contain '#'.")
+    """Reject what could never be a valid value; the store is JSON, so that is little.
+
+    A path may contain a space or a '#'. A control character (a newline above
+    all) has no place in any setting and would break the one-line summaries.
+    """
+    if re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError(f"Invalid {key}: {value!r} must not contain control characters or newlines.")
     if key == "center" and value not in CENTER_SCHEDULERS:
         raise ValueError(f"Invalid center: {value!r}. Expected one of {', '.join(CENTER_SCHEDULERS)}.")
     if key == "role":
@@ -2177,6 +2179,8 @@ def record_host(
         )
     _validate_host(host)
 
+    # Every reader lowercases these, so accept what the reader would.
+    center, role, policy = center.lower(), role.lower(), policy.lower()
     values = {"center": center, "role": role, "account": account,
               "scratch": scratch, "globus": globus, "policy": policy}
     for key, value in values.items():
@@ -2184,10 +2188,10 @@ def record_host(
             _validate_setting(key, str(value))
 
     if is_hpc is False:
-        # Nothing about schedulers, accounts or filesystems applies off an HPC system.
+        # Nothing about schedulers, accounts or filesystems applies off an HPC
+        # system. A policy and a Globus collection are not HPC-only.
         pairs = {"hpc": False}
-        if policy:
-            pairs["policy"] = policy
+        pairs.update({k: v for k, v in (("policy", policy), ("globus", globus)) if v})
     else:
         pairs = {k: v for k, v in values.items() if v}
         if role:

@@ -426,3 +426,44 @@ class TestProbeNeedsMoreThanAGenericMount:
         result = ssh_hpc_server.probe_host("box")
         assert "record_host(host='box', )" not in result, result
         assert "does not look like a shared HPC system" in result, result
+
+
+# ---------------------------------------------------------------------------
+# F14: _validate_setting left the 1.7.0 comment format behind in 1.8.0
+# ---------------------------------------------------------------------------
+# Its docstring still said values "live in a single-line, space-separated comment",
+# and it rejected whitespace and '#' for that reason. The store has been JSON since
+# 1.8.0; a path with a space or a '#' is a legal path. record_host was also
+# case-sensitive where every reader lowercases, and is_hpc=False dropped a globus
+# UUID, which is not an HPC-only setting.
+
+GLADE = "d33b3614-6d04-11e5-ba46-22000b92c6ec"
+
+
+class TestSettingsValidationMatchesTheJsonStore:
+    @pytest.mark.parametrize("value", ["/glade/work/u/run#1", "/glade/work/u/my run"])
+    def test_a_legal_path_is_accepted(self, store, value):
+        ssh_hpc_server.record_host("derecho", scratch=value)
+        assert ssh_hpc_server._host_settings("derecho")["scratch"] == value
+
+    def test_a_control_character_is_still_refused(self, store):
+        with pytest.raises(ValueError, match="scratch"):
+            ssh_hpc_server.record_host("derecho", scratch="/x\npolicy=off")
+
+    def test_the_docstring_no_longer_describes_a_comment(self):
+        assert "comment" not in (ssh_hpc_server._validate_setting.__doc__ or "").lower()
+
+    @pytest.mark.parametrize("kwargs,key,stored", [
+        ({"role": "Login"}, "role", "login"),
+        ({"role": "Data-Access"}, "role", "dtn"),
+        ({"center": "NCAR"}, "center", "ncar"),
+        ({"policy": "OFF"}, "policy", "off"),
+    ])
+    def test_case_is_folded_as_the_readers_fold_it(self, store, kwargs, key, stored):
+        ssh_hpc_server.record_host("derecho", **kwargs)
+        assert ssh_hpc_server._host_settings("derecho")[key] == stored
+
+    def test_a_non_hpc_host_keeps_its_globus_collection(self, store):
+        ssh_hpc_server.record_host("laptop", is_hpc=False, globus=GLADE)
+        assert ssh_hpc_server._is_hpc("laptop") is False
+        assert ssh_hpc_server._resolve_collection("laptop") == GLADE
