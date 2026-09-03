@@ -376,7 +376,7 @@ class TestToolAnnotations:
                  "check_ssh_connection", "probe_host", "globus_status",
                  "globus_find_collection", "globus_ls", "globus_task_status"}
     MUTATING = {"execute_remote_bash", "submit_job", "cancel_job", "run_on_compute",
-                "scp_download_file", "scp_upload_file", "annotate_host",
+                "scp_download_file", "scp_upload_file", "record_host",
                 "globus_transfer", "globus_task_cancel"}
 
     async def _tools(self):

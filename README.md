@@ -16,7 +16,7 @@ It shells out to the system `ssh` and `scp` binaries rather than using a Python 
 - [Connect your coding agent](#connect-your-coding-agent)
 - [Tools](#tools)
 - [Command policy](#command-policy)
-- [Host metadata](#host-metadata-in-the-file-you-already-have)
+- [Host settings](#host-settings)
 - [Globus transfers](#globus-transfers)
 - [Testing](#testing)
 - [Changelog](#changelog)
@@ -219,12 +219,11 @@ Every product above accepts an `env` object beside `command` and `args`. In Code
 ```json
 "env": {
   "HPC_SSH_MCP_POLICY": "strict",
-  "HPC_SSH_MCP_SSH_CONFIG": "/home/you/.ssh/config",
   "HPC_SSH_MCP_STORE": "/home/you/.config/hpc-ssh-mcp/hosts.json"
 }
 ```
 
-`HPC_SSH_MCP_POLICY` sets the [command policy](#command-policy) for the session. `HPC_SSH_MCP_SSH_CONFIG` points at a non-standard SSH config, read only. `HPC_SSH_MCP_STORE` moves the file `annotate_host` writes to.
+`HPC_SSH_MCP_POLICY` sets the [command policy](#command-policy) for the session. `HPC_SSH_MCP_STORE` moves the [settings file](#host-settings) `record_host` writes to.
 
 ## Tools
 
@@ -242,7 +241,7 @@ Every product above accepts an `env` object beside `command` and `args`. In Code
 | `scp_upload_file` | Upload a file via `scp` |
 | `check_ssh_connection` | Verify the ControlMaster socket is alive |
 | `probe_host` | Detect what a host is: scheduler, filesystems, account, Globus |
-| `annotate_host` | Record what a host is, in the server's own settings file |
+| `record_host` | Record what a host is, in the server's own settings file |
 | `globus_status` | Which Globus identity this machine is logged in as |
 | `globus_find_collection` | Search Globus for a collection UUID by name |
 | `globus_ls` | List a directory on a Globus collection |
@@ -269,7 +268,7 @@ Whichever path comes back is the scheduler. As a shortcut for the systems in thi
 | NSF NCAR Derecho, Casper | PBS Pro | `qsub` | `qstat` | `qdel` |
 | CU Boulder Alpine, Blanca | Slurm | `sbatch` | `squeue` | `scancel` |
 
-Annotating the host with `center=ncar` or `center=curc` skips the probe entirely. You can also pass `scheduler="pbs"` or `scheduler="slurm"` to any job tool to override both. Job IDs are validated per scheduler: `2426690.desched1` and `123[].desched1` on PBS, `12345`, `12345_0` and `12345.0` on Slurm.
+Recording `center=ncar` or `center=curc` for the host skips the probe entirely. You can also pass `scheduler="pbs"` or `scheduler="slurm"` to any job tool to override both. Job IDs are validated per scheduler: `2426690.desched1` and `123[].desched1` on PBS, `12345`, `12345_0` and `12345.0` on Slurm.
 
 `submit_job` accepts `remote_dir` so scripts are written to, and submitted from, a scratch or work directory rather than `$HOME`.
 
@@ -290,17 +289,17 @@ Scheduler queries are rate-limited to one identical query per host every 30 seco
 
 ### When you really do want to run a blocked command
 
-Sometimes the guard is wrong, or you know exactly what you are doing and accept the risk. The override is deliberately **not a tool parameter**: a rail the agent can disable on its own is not a rail. Only you can relax it, either in `~/.ssh/config`:
+Sometimes the guard is wrong, or you know exactly what you are doing and accept the risk. The refusal never points the agent at a way to lift it. Relax it yourself, either by giving the host a `policy` in the [settings file](#host-settings):
 
-```sshconfig
-Host shared-cluster
-    # hpc-mcp: policy=permissive   # block tier becomes a confirmation
-
-Host *
-    # hpc-mcp: policy=strict       # the default, stated explicitly
+```json
+{
+  "hosts": {
+    "shared-cluster": { "policy": "permissive" }
+  }
+}
 ```
 
-For a machine that is not an HPC system at all, say so instead of loosening the policy: `# hpc-mcp: hpc=false` turns the whole thing off for that host, which is what it is for.
+For a machine that is not an HPC system at all, say so instead of loosening the policy: `"hpc": false` turns the whole thing off for that host, which is what it is for.
 
 or for a single session, by launching the server with an environment variable:
 
@@ -316,60 +315,53 @@ or for a single session, by launching the server with an environment variable:
 
 A refusal in strict mode tells you these options, so you never have to come back here to find them. `permissive` is the useful middle ground on a cluster: nothing is silently prevented, and nothing dangerous happens without you saying yes.
 
-## Host metadata, in the file you already have
+## Host settings
 
-Your hosts are already described in `~/.ssh/config`, so there is no second config file to keep in sync. The few things SSH has no keyword for ride along in a comment inside the `Host` block:
+A few things about a host cannot be discovered from the host itself, or are too slow to rediscover every session. They live in one small JSON file this server owns, keyed by the SSH alias you connect with:
 
-```sshconfig
-Host derecho
-    HostName derecho.hpc.ucar.edu
-    User yourusername
-    ControlMaster auto
-    ControlPath ~/.ssh/sockets/%r@%h-%p
-    ControlPersist 48h
-    # hpc-mcp: center=ncar role=login account=UABC0001 scratch=/glade/derecho/scratch/$USER
+```json
+{
+  "hosts": {
+    "derecho": {
+      "center": "ncar",
+      "role": "login",
+      "account": "UABC0001",
+      "scratch": "/glade/derecho/scratch/$USER"
+    },
+    "laptop": { "hpc": false }
+  }
+}
 ```
 
-`ssh` ignores the comment; this server reads it and never writes to it. Every key is optional, and with no annotation at all the server probes for the scheduler and treats the host as an HPC login node, which is the cautious reading.
+It lives at `~/.config/hpc-ssh-mcp/hosts.json` (`HPC_SSH_MCP_STORE` moves it), and you never have to write it by hand — see [letting the agent fill this in](#letting-the-agent-fill-this-in). Every key is optional, and with nothing recorded the server probes for the scheduler and treats the host as an HPC login node, which is the cautious reading.
 
-There are two places these settings can come from: this comment, written by you, and `~/.config/hpc-ssh-mcp/hosts.json`, written by [`annotate_host`](#letting-the-agent-fill-this-in). Yours wins, key by key.
+**`~/.ssh/config` is neither written nor read.** It is still what `ssh` itself uses to make the connection — aliases, `ControlMaster`, keys, all of it — but this server does not look inside it. Earlier versions kept these keys in a `# hpc-mcp:` comment in the matching `Host` block; that is gone, and a leftover comment is inert. See [1.9.0](#190) for how to move.
 
 | Key | Values | Effect |
 |---|---|---|
 | `hpc` | `false` | This host is not a shared HPC system. Login-node etiquette and the whole [command policy](#command-policy) stop applying. |
 | `center` | `ncar`, `curc` | Selects PBS or Slurm without probing the host. |
 | `role` | `login`, `data-access`, `compute` | Sets the command policy tier. `data-access` allows transfers while still routing compute away. |
-| `account` | project code | Default `-A` / `--account` for `run_on_compute` and `submit_job`. |
+| `account` | project code | Default `-A` / `--account` for `run_on_compute`. |
 | `scratch` | path | Suggested as `remote_dir` when `submit_job` is called without one. |
 | `globus` | collection UUID | Lets Globus tools name this SSH alias instead of a UUID. |
 | `policy` | `strict`, `permissive`, `off` | See [when you really do want to run a blocked command](#when-you-really-do-want-to-run-a-blocked-command). |
 
-Put several on one line or use several comment lines, whichever reads better. A `Host *` block sets a default for every host, and a specific block wins over it, exactly as SSH resolves its own options.
+Aliases are matched exactly: a host is described because you described it, never because a wildcard happened to cover it. There is no defaults-for-everything entry — set `HPC_SSH_MCP_POLICY` if you want one policy for a whole session.
 
 ### Letting the agent fill this in
 
-You do not have to write these by hand. The first time a tool touches a host with no annotation, the result carries a one-line notice, and the agent can offer to sort it out:
+You do not have to write the file by hand. The first time a tool touches a host with nothing recorded, the result carries a one-line notice, and the agent can offer to sort it out:
 
-1. `probe_host` connects and reports what it finds: the scheduler, which of the known HPC filesystems are mounted, any project code in the environment, and whether the Globus CLI is installed. It proposes an annotation and lists what it cannot detect.
+1. `probe_host` connects and reports what it finds: the scheduler, which of the known HPC filesystems are mounted, any project code in the environment, and whether the Globus CLI is installed. It proposes settings and lists what it cannot detect.
 2. The agent asks you the rest. Whether this really is a shared HPC system, which project code jobs should charge, and which policy level you want. It is told not to choose the policy for you.
-3. `annotate_host` records your answers. Calling it again updates the keys you pass and leaves the rest alone, so relaxing one host's policy later does not erase its project code. To remove a setting, edit or delete the file.
+3. `record_host` records your answers. Calling it again updates the keys you pass and leaves the rest alone, so relaxing one host's policy later does not erase its project code. To remove a setting, edit the file.
 
-**It does not write to `~/.ssh/config`, and nothing here ever will.** That file controls access to every host you have. A mangled line, a replaced symlink from a dotfile manager, or a downgraded file mode would cost you far more than the convenience is worth, so the server reads it and leaves it alone.
+**It does not touch `~/.ssh/config`, and nothing here ever will.** That file controls access to every host you have. A mangled line, a replaced symlink from a dotfile manager, or a downgraded file mode would cost you far more than the convenience is worth, so the server leaves it entirely alone — it does not even read it.
 
-Answers go to a small JSON file the server owns, `~/.config/hpc-ssh-mcp/hosts.json` (set `HPC_SSH_MCP_STORE` to move it):
+Delete the settings file, edit it, or check it into nothing at all: the worst case is that hosts fall back to safe defaults. If it ever becomes unreadable, the server says so and refuses to rewrite it rather than discarding what it held.
 
-```json
-{
-  "hosts": {
-    "derecho": { "center": "ncar", "role": "login", "account": "UABC0001" },
-    "laptop": { "hpc": false }
-  }
-}
-```
-
-Delete it, edit it, or check it into nothing at all: the worst case is that hosts fall back to safe defaults. If it ever becomes unreadable, the server says so and refuses to rewrite it rather than discarding what it held. And a `# hpc-mcp:` comment you write by hand in `~/.ssh/config` always beats it, so your own statement is never overridden by something a tool decided.
-
-Nothing is written until you have answered, and the notice is a nudge rather than a gate: an unannotated host keeps working.
+Nothing is written until you have answered, and the notice is a nudge rather than a gate: an unrecorded host keeps working.
 
 ## Globus transfers
 
@@ -392,11 +384,10 @@ Hint: this collection needs a one-time data_access consent, granted from your ow
 Then retry.
 ```
 
-Record a collection UUID on the Host block for that system, and the tools accept the SSH alias you already use:
+Record a collection UUID against the SSH alias for that system, and the tools accept the alias you already use:
 
-```sshconfig
-Host derecho
-    # hpc-mcp: globus=d33b3614-6d04-11e5-ba46-22000b92c6ec
+```
+record_host(host="derecho", globus="d33b3614-6d04-11e5-ba46-22000b92c6ec")
 ```
 
 A transfer is then `globus_transfer(source="derecho", source_path="/glade/work/me/run1", dest="cu-alpine", dest_path="/scratch/alpine/me/run1", recursive=True)`. A bare UUID always works too, and `globus_find_collection` looks one up by name. Transfers default to `--sync-level mtime`, so re-running one is idempotent. Mirroring with `--delete-destination-extra` requires `confirm_destructive=true`.
@@ -415,9 +406,22 @@ The unit suite mocks `subprocess.run`. The live suite exists because several rea
 
 ## Version
 
-1.8.0
+1.9.0
 
 ## Changelog
+
+### 1.9.0
+
+**Breaking: `~/.ssh/config` is no longer read, and `annotate_host` is now `record_host`.**
+
+Host settings come from one place: `~/.config/hpc-ssh-mcp/hosts.json`. 1.7.0 stopped *writing* to `~/.ssh/config` but went on reading a `# hpc-mcp:` comment out of it, which was still the wrong call. It kept a parser for someone else's file format in this tree; it gave one word ("annotation") two meanings, one of them the dangerous behaviour that had already been removed; and because ssh patterns match by wildcard, a `Host *` block answered "yes, this host is described" for every alias you had never mentioned — which silenced the first-use notice for every host and made `probe_host` claim a brand-new host was already set up.
+
+- **`~/.ssh/config` is neither written nor read.** It is still what `ssh` uses to connect; this server does not open it. `HPC_SSH_MCP_SSH_CONFIG` is gone.
+- **To move:** for each host with a `# hpc-mcp:` comment, run `record_host(host="<alias>", ...)` with the same keys, or write the JSON yourself. The leftover comment is inert and `ssh` ignores it, so you can delete it whenever. `probe_host` will offer to do this for you on first contact.
+- **A `Host *` default has no equivalent**, deliberately: aliases are matched exactly. Use `HPC_SSH_MCP_POLICY` for a session-wide policy.
+- **`annotate_host` is renamed `record_host`**, and "annotation" is gone from the vocabulary — the file holds *settings*. MCP's own `ToolAnnotations` is a different thing and keeps its name.
+- **The policy refusal no longer names a tool.** It points at the settings file and `HPC_SSH_MCP_POLICY`, so the escape stays the human's.
+- **`account` is documented as `run_on_compute` only**, which is all it ever was; `submit_job` takes the account from the `#PBS -A` / `#SBATCH --account` line in your script.
 
 ### 1.8.0
 

@@ -20,7 +20,7 @@ import pytest
 import ssh_hpc_server
 from ssh_hpc_server import (
     _detect_scheduler,
-    annotate_host,
+    record_host,
     probe_host,
     check_ssh_connection,
     execute_remote_bash,
@@ -209,40 +209,48 @@ class TestLivePolicy:
 
 
 class TestLiveOnboarding:
-    """probe_host reads the real machine; annotate_host writes a scratch config."""
+    """probe_host reads the real machine; record_host writes a scratch config."""
 
     @pytest.fixture
-    def scratch_config(self, tmp_path, monkeypatch):
-        """A throwaway ssh config and store. The real ~/.ssh/config is never
-        touched by these tests, and must never be touched by the code either."""
-        cfg = tmp_path / "config"
-        cfg.write_text(f"Host {HOST}\n    HostName {HOST}\n    ControlMaster auto\n")
-        monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(cfg))
+    def scratch_store(self, tmp_path, monkeypatch):
+        """A throwaway settings store. The real ~/.ssh/config still resolves the
+        connection, and must come back untouched -- nothing here reads or
+        writes it."""
+        real_config = os.path.expanduser("~/.ssh/config")
+        before = open(real_config, "rb").read() if os.path.exists(real_config) else None
         monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "hosts.json"))
-        ssh_hpc_server._DIRECTIVE_CACHE = None
+        ssh_hpc_server._STORE_CACHE = None
         ssh_hpc_server._ONBOARDING_SEEN.clear()
-        yield cfg
-        ssh_hpc_server._DIRECTIVE_CACHE = None
+        yield tmp_path / "hosts.json"
+        ssh_hpc_server._STORE_CACHE = None
         ssh_hpc_server._ONBOARDING_SEEN.clear()
+        after = open(real_config, "rb").read() if os.path.exists(real_config) else None
+        assert after == before, "~/.ssh/config was modified by a live test"
 
-    def test_probe_reports_the_real_host(self, scratch_config):
+    def test_probe_reports_the_real_host(self, scratch_store):
         out = probe_host(HOST)
         assert "Detected:" in out
         assert "hostname" in out
-        assert "annotate_host" in out or "is_hpc=False" in out
+        assert "record_host" in out or "is_hpc=False" in out
 
-    def test_annotate_round_trip(self, scratch_config, tmp_path):
+    def test_record_round_trip(self, scratch_store):
+        """The fixture asserts ~/.ssh/config comes back byte-identical."""
         import json
-        before = scratch_config.read_bytes()
-        assert "Recorded" in annotate_host(HOST, is_hpc=False)
-        stored = json.loads((tmp_path / "hosts.json").read_text())
+        assert not scratch_store.exists()
+        assert "Recorded" in record_host(HOST, is_hpc=False)
+        stored = json.loads(scratch_store.read_text())
         assert stored["hosts"][HOST]["hpc"] is False
-        assert scratch_config.read_bytes() == before  # ssh config untouched
         assert ssh_hpc_server._is_hpc(HOST) is False
         assert ssh_hpc_server._policy_mode(HOST) == "off"
 
-    def test_non_hpc_host_runs_a_routed_command_without_a_flag(self, scratch_config):
-        annotate_host(HOST, is_hpc=False)
+    def test_a_partial_update_keeps_what_it_does_not_mention(self, scratch_store):
+        record_host(HOST, is_hpc=False)
+        record_host(HOST, account="UABC0001")
+        assert ssh_hpc_server._is_hpc(HOST) is False
+        assert ssh_hpc_server._host_settings(HOST)["account"] == "UABC0001"
+
+    def test_non_hpc_host_runs_a_routed_command_without_a_flag(self, scratch_store):
+        record_host(HOST, is_hpc=False)
         assert _ok(execute_remote_bash(HOST, "python3 -c 'print(41+1)'")).strip() == "42"
 
 

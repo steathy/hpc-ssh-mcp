@@ -213,7 +213,7 @@ SSH_TOOLS = {
     "scp_upload_file",
     "check_ssh_connection",
     "probe_host",
-    "annotate_host",
+    "record_host",
 }
 
 # The Globus CLI talks to the Globus API, not to a host, so these take no host.

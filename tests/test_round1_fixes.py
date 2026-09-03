@@ -216,10 +216,9 @@ class TestOnlySuccessIsCached:
 def store(tmp_path, monkeypatch):
     path = tmp_path / "hosts.json"
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
-    monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(tmp_path / "no-such-ssh-config"))
-    ssh_hpc_server._DIRECTIVE_CACHE = None
+    ssh_hpc_server._STORE_CACHE = None
     yield path
-    ssh_hpc_server._DIRECTIVE_CACHE = None
+    ssh_hpc_server._STORE_CACHE = None
 
 
 GLADE = "d33b3614-6d04-11e5-ba46-22000b92c6ec"
@@ -229,19 +228,19 @@ class TestPartialAnnotationKeepsTheRest:
     def test_hpc_false_survives_a_later_unrelated_annotation(self, store):
         """The model records an account and never mentions is_hpc; the laptop
         must not turn back into an HPC login node."""
-        ssh_hpc_server.annotate_host("venus", is_hpc=False)
+        ssh_hpc_server.record_host("venus", is_hpc=False)
         assert ssh_hpc_server._policy_mode("venus") == "off"
-        ssh_hpc_server.annotate_host("venus", account="UABC0001")
+        ssh_hpc_server.record_host("venus", account="UABC0001")
         assert ssh_hpc_server._is_hpc("venus") is False
         assert ssh_hpc_server._policy_mode("venus") == "off"
 
     def test_a_key_that_was_not_passed_is_kept(self, store):
-        ssh_hpc_server.annotate_host(
+        ssh_hpc_server.record_host(
             "derecho", center="ncar", role="login", account="UABC0001",
             scratch="/glade/derecho/scratch/x", globus=GLADE,
         )
-        ssh_hpc_server.annotate_host("derecho", policy="permissive")
-        directives = ssh_hpc_server._host_directives("derecho")
+        ssh_hpc_server.record_host("derecho", policy="permissive")
+        directives = ssh_hpc_server._host_settings("derecho")
         assert directives["center"] == "ncar"
         assert directives["account"] == "UABC0001"
         assert directives["globus"] == GLADE
@@ -250,25 +249,25 @@ class TestPartialAnnotationKeepsTheRest:
     def test_a_recorded_globus_uuid_is_not_lost(self, store):
         """The 1.8.0 changelog treats a write-only UUID as a bug; so is a
         UUID that the next annotation deletes."""
-        ssh_hpc_server.annotate_host("derecho", center="ncar", globus=GLADE)
-        ssh_hpc_server.annotate_host("derecho", account="UABC0001")
+        ssh_hpc_server.record_host("derecho", center="ncar", globus=GLADE)
+        ssh_hpc_server.record_host("derecho", account="UABC0001")
         assert ssh_hpc_server._resolve_collection("derecho") == GLADE
 
     def test_a_repassed_key_is_still_overwritten(self, store):
-        ssh_hpc_server.annotate_host("derecho", center="ncar", account="OLD001")
-        ssh_hpc_server.annotate_host("derecho", account="NEW002")
-        assert ssh_hpc_server._host_directives("derecho")["account"] == "NEW002"
+        ssh_hpc_server.record_host("derecho", center="ncar", account="OLD001")
+        ssh_hpc_server.record_host("derecho", account="NEW002")
+        assert ssh_hpc_server._host_settings("derecho")["account"] == "NEW002"
         assert "OLD001" not in store.read_text()
 
     def test_the_result_reports_everything_now_recorded(self, store):
         """Reporting only the new pairs hid what the write had just changed."""
-        ssh_hpc_server.annotate_host("derecho", center="ncar", account="UABC0001")
-        result = ssh_hpc_server.annotate_host("derecho", policy="permissive")
+        ssh_hpc_server.record_host("derecho", center="ncar", account="UABC0001")
+        result = ssh_hpc_server.record_host("derecho", policy="permissive")
         assert "center=ncar" in result, result
         assert "account=UABC0001" in result, result
         assert "policy=permissive" in result, result
 
     def test_other_hosts_are_untouched(self, store):
-        ssh_hpc_server.annotate_host("alpine", center="curc", account="ucb999")
-        ssh_hpc_server.annotate_host("derecho", center="ncar")
-        assert ssh_hpc_server._host_directives("alpine")["account"] == "ucb999"
+        ssh_hpc_server.record_host("alpine", center="curc", account="ucb999")
+        ssh_hpc_server.record_host("derecho", center="ncar")
+        assert ssh_hpc_server._host_settings("alpine")["account"] == "ucb999"

@@ -32,26 +32,21 @@ from ssh_hpc_server import (
 GLADE = "d33b3614-6d04-11e5-ba46-22000b92c6ec"
 ALPINE = "aa3b3614-6d04-11e5-ba46-22000b92c6ff"
 
-SSH_CONFIG = f"""
-Host glade
-    HostName derecho.hpc.ucar.edu
-    # hpc-mcp: center=ncar globus={GLADE}
-
-Host alpine
-    HostName login.rc.colorado.edu
-    # hpc-mcp: center=curc globus={ALPINE}
-"""
+COLLECTIONS = {
+    "glade": {"center": "ncar", "globus": GLADE},
+    "alpine": {"center": "curc", "globus": ALPINE},
+}
 
 
 @pytest.fixture
 def profiles(tmp_path, monkeypatch):
-    """Globus collections are named by their annotated SSH host alias."""
-    path = tmp_path / "config"
-    path.write_text(SSH_CONFIG)
-    monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(path))
-    ssh_hpc_server._DIRECTIVE_CACHE = None
+    """Globus collections are named by the SSH alias they are recorded under."""
+    path = tmp_path / "hosts.json"
+    path.write_text(json.dumps({"hosts": COLLECTIONS}))
+    monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
+    ssh_hpc_server._STORE_CACHE = None
     yield path
-    ssh_hpc_server._DIRECTIVE_CACHE = None
+    ssh_hpc_server._STORE_CACHE = None
 
 
 @pytest.fixture

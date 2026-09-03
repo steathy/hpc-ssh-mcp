@@ -13,6 +13,8 @@ relax it, by editing hosts.toml or launching the server with an environment
 variable.
 """
 
+import json
+
 import pytest
 
 from tests.conftest import make_completed_process
@@ -83,10 +85,10 @@ class TestSharedRootTraversal:
     def test_a_non_hpc_host_is_not_policed_at_all(self, tmp_path, monkeypatch):
         """hpc=false turns the policy off, rather than being a role."""
         cfg = tmp_path / "config"
-        cfg.write_text("Host box\n    # hpc-mcp: hpc=false\n")
-        monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(cfg))
+        cfg.write_text(json.dumps({"hosts": {"box": {"hpc": False}}}))
+        monkeypatch.setenv("HPC_SSH_MCP_STORE", str(cfg))
         monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-        ssh_hpc_server._DIRECTIVE_CACHE = None
+        ssh_hpc_server._STORE_CACHE = None
         assert ssh_hpc_server._policy_mode("box") == "off"
 
 
@@ -123,30 +125,22 @@ class TestNcarSpecificRules:
 # The human-controlled policy escape
 # ---------------------------------------------------------------------------
 
-POLICY_SSH_CONFIG = """
-Host derecho
-    HostName derecho.hpc.ucar.edu
-    # hpc-mcp: center=ncar role=login
-
-Host my-box
-    HostName 10.0.0.5
-    # hpc-mcp: hpc=false
-
-Host loose
-    HostName loose.example.edu
-    # hpc-mcp: role=login policy=permissive
-"""
+POLICY_SETTINGS = {
+    "derecho": {"center": "ncar", "role": "login"},
+    "my-box": {"hpc": False},
+    "loose": {"role": "login", "policy": "permissive"},
+}
 
 
 @pytest.fixture
 def policy_profiles(tmp_path, monkeypatch):
-    path = tmp_path / "config"
-    path.write_text(POLICY_SSH_CONFIG)
-    monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(path))
+    path = tmp_path / "hosts.json"
+    path.write_text(json.dumps({"hosts": POLICY_SETTINGS}))
+    monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
     monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-    ssh_hpc_server._DIRECTIVE_CACHE = None
+    ssh_hpc_server._STORE_CACHE = None
     yield path
-    ssh_hpc_server._DIRECTIVE_CACHE = None
+    ssh_hpc_server._STORE_CACHE = None
 
 
 class TestPolicyMode:
@@ -165,10 +159,10 @@ class TestPolicyMode:
         monkeypatch.setenv("HPC_SSH_MCP_POLICY", "yolo")
         assert _policy_mode("derecho") == "strict"
 
-    def test_no_config_at_all_is_strict(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(tmp_path / "absent"))
+    def test_no_settings_at_all_is_strict(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "absent.json"))
         monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-        ssh_hpc_server._DIRECTIVE_CACHE = None
+        ssh_hpc_server._STORE_CACHE = None
         assert _policy_mode("anything") == "strict"
 
 
@@ -201,9 +195,16 @@ class TestPolicyModeChangesEnforcement:
 
     def test_strict_refusal_tells_the_human_how_to_relax_it(self, policy_profiles):
         refusal = execute_remote_bash(host="derecho", command="sudo ls")
-        assert "~/.ssh/config" in refusal
-        assert "policy=permissive" in refusal
+        assert "permissive" in refusal
         assert "HPC_SSH_MCP_POLICY" in refusal
+        assert "settings file" in refusal
+
+    def test_the_refusal_does_not_point_the_model_at_a_tool(self, policy_profiles):
+        """The escape belongs to the human. record_host would hand it to the
+        model, so the refusal names the file and the env var, and nothing else."""
+        refusal = execute_remote_bash(host="derecho", command="sudo ls")
+        assert "record_host" not in refusal
+        assert "do not do it for them" in refusal
 
     def test_the_model_cannot_change_the_mode_through_a_tool(self):
         """No tool takes a policy argument: the escape lives in config only."""
