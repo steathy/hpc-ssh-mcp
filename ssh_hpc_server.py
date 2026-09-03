@@ -7,9 +7,11 @@ and ControlMaster multiplex sockets (avoiding MFA re-prompts).
 Run with:  uv run ssh_hpc_server.py
 """
 
+import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 import tomllib
@@ -18,7 +20,7 @@ import uuid
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
@@ -163,6 +165,7 @@ def _run_raw(
     cmd: list[str],
     timeout: int = DEFAULT_TIMEOUT,
     input_data: str | None = None,
+    env: dict | None = None,
 ) -> tuple[int, str, str]:
     """Execute a subprocess and return (returncode, stdout, stderr).
 
@@ -182,6 +185,7 @@ def _run_raw(
             timeout=timeout,
             input=input_data,
             stdin=None if input_data is not None else subprocess.DEVNULL,
+            env=env,
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired as exc:
@@ -1150,6 +1154,333 @@ def check_ssh_connection(host: str) -> str:
     if rc == 0:
         return err.strip() or out.strip() or "Master running"
     return _format_result(rc, out, err) + _diagnose_ssh_failure(host, err)
+
+
+# ---------------------------------------------------------------------------
+# Globus transfer tools
+# ---------------------------------------------------------------------------
+# Both NSF NCAR and CU Boulder point at Globus for bulk data movement. The
+# Globus CLI talks to the Globus API rather than to a cluster, so it runs
+# locally: no login node is involved and no SSH session is needed.
+#
+# Auth is the CLI's job, out of band, exactly like `ssh -fN <host>` for Duo:
+#   uv tool install globus-cli && globus login
+# GCS v5 mapped collections (NCAR GLADE, NCAR Campaign Storage, CU Boulder
+# Research Computing) additionally need a one-time per-collection data_access
+# consent. The CLI signals both with exit code 4, which is translated below
+# into the exact command to run.
+
+GLOBUS_EXIT_AUTH = 4
+DEFAULT_GLOBUS_TIMEOUT = 120
+SYNC_LEVELS = ("exists", "size", "mtime", "checksum")
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+_VALID_LABEL_RE = re.compile(r"^[A-Za-z0-9 ._,:+-]{1,128}$")
+_CONSENT_SCOPE = (
+    "urn:globus:auth:scope:transfer.api.globus.org:all"
+    "[*https://auth.globus.org/scopes/{uuid}/data_access]"
+)
+_LOGIN_STEPS = (
+    "Globus auth is granted in your own terminal, not by this server:\n"
+    "    uv tool install globus-cli    # if it is not installed\n"
+    "    globus login"
+)
+
+
+def _globus_cli_available() -> bool:
+    return shutil.which("globus") is not None
+
+
+def _globus_env() -> dict:
+    """Environment for the CLI: never prompt, we have no terminal."""
+    env = dict(os.environ)
+    env["GLOBUS_CLI_INTERACTIVE"] = "0"
+    return env
+
+
+def _globus_collections() -> dict:
+    raw = _load_profiles().get("globus", {}).get("collections", {})
+    return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+
+def _resolve_collection(value: str) -> str:
+    """Turn an alias from hosts.toml or a bare UUID into a collection UUID."""
+    known = _globus_collections()
+    if value in known:
+        value = known[value]
+    if not _UUID_RE.match(value or ""):
+        names = ", ".join(sorted(known)) or "(none configured)"
+        raise ValueError(
+            f"Unknown Globus collection: {value!r}. Expected a UUID or one of the aliases "
+            f"in the [globus.collections] table of your hosts.toml: {names}. "
+            "Use globus_find_collection to look a collection up by name."
+        )
+    return value.lower()
+
+
+def _validate_task_id(task_id: str) -> str:
+    if not _UUID_RE.match(task_id or ""):
+        raise ValueError(f"Invalid Globus task ID: {task_id!r}. Expected a UUID.")
+    return task_id.lower()
+
+
+def _globus_auth_hint(stderr: str) -> str:
+    """Translate a CLI exit-4 into the command that fixes it."""
+    m = re.search(r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", stderr or "")
+    if "consentrequired" in (stderr or "").lower().replace(" ", "") and m:
+        scope = _CONSENT_SCOPE.format(uuid=m.group(1).lower())
+        return (
+            "\n\nHint: this collection needs a one-time data_access consent. "
+            "From your own terminal, run:\n"
+            f"    globus session consent '{scope}'\nThen retry."
+        )
+    return f"\n\nHint: {_LOGIN_STEPS}\nThen retry."
+
+
+def _run_globus(args: list[str], timeout: int = DEFAULT_GLOBUS_TIMEOUT) -> tuple[int, str, str]:
+    return _run_raw(["globus", *args], timeout=timeout, env=_globus_env())
+
+
+def _globus_json(args: list[str], timeout: int = DEFAULT_GLOBUS_TIMEOUT):
+    """Run a CLI command with JSON output. Returns (data, error_text).
+
+    Exactly one of the two is None: parsed JSON on success, a ready-to-return
+    message (with an auth hint where that is the cause) on failure.
+    """
+    rc, out, err = _run_globus([*args, "--format", "json"], timeout=timeout)
+    if rc != 0:
+        msg = _format_result(rc, out, err)
+        if rc == GLOBUS_EXIT_AUTH:
+            msg += _globus_auth_hint(err)
+        return None, msg
+    try:
+        return json.loads(out or "null"), None
+    except json.JSONDecodeError:
+        return None, f"Could not parse Globus CLI output as JSON:\n{_truncate(out, 4000)}"
+
+
+def _globus_unavailable() -> str:
+    return (
+        "The Globus CLI is not installed or not on PATH, so this tool cannot run.\n"
+        f"{_LOGIN_STEPS}\n"
+        "The CLI runs locally and never touches a login node."
+    )
+
+
+def _human_bytes(n) -> str:
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def globus_status() -> str:
+    """Show which Globus identity this machine is logged in as.
+
+    Call this first when a Globus transfer is wanted: if it reports a missing
+    login, every other Globus tool will fail the same way, and only the user
+    can fix it from their own terminal.
+    """
+    if not _globus_cli_available():
+        return _globus_unavailable()
+    data, err = _globus_json(["whoami"])
+    if err:
+        return err
+    if not isinstance(data, dict):
+        return str(data)
+    who = data.get("username") or data.get("name") or "(unknown)"
+    return f"Logged in to Globus as {who}.\n" + "\n".join(
+        f"{k}: {v}" for k, v in data.items() if k not in ("username",) and v
+    )
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def globus_find_collection(query: str) -> str:
+    """Search Globus for a collection by name and return its UUID.
+
+    Useful names: 'NCAR GLADE', 'NCAR Campaign Storage', 'NCAR Data Sharing
+    Service', 'CU Boulder Research Computing'. Put the UUIDs you use often in
+    the [globus.collections] table of hosts.toml so later calls can name them.
+
+    Args:
+        query: Text to search collection names for.
+    """
+    if not _globus_cli_available():
+        return _globus_unavailable()
+    data, err = _globus_json(["endpoint", "search", query])
+    if err:
+        return err
+    rows = data if isinstance(data, list) else data.get("DATA", []) if isinstance(data, dict) else []
+    if not rows:
+        return f"No collection matched {query!r}."
+    lines = [f"{r.get('id')}  {r.get('display_name') or r.get('name')}  "
+             f"(owner: {r.get('owner_string', '?')})" for r in rows[:25]]
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def globus_ls(collection: str, path: str = "/") -> str:
+    """List a directory on a Globus collection without touching a login node.
+
+    Args:
+        collection: Collection UUID, or an alias from hosts.toml.
+        path: Absolute path on that collection (default '/').
+    """
+    if not _globus_cli_available():
+        return _globus_unavailable()
+    uuid_ = _resolve_collection(collection)
+    data, err = _globus_json(["ls", f"{uuid_}:{path}"])
+    if err:
+        return err
+    rows = data.get("DATA", []) if isinstance(data, dict) else data or []
+    if not rows:
+        return f"(empty: {path})"
+    lines = []
+    for r in rows[:500]:
+        kind = r.get("type", "")
+        size = "" if kind == "dir" else f"  {_human_bytes(r.get('size', 0))}"
+        lines.append(f"{'d' if kind == 'dir' else '-'} {r.get('name')}{size}")
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=_ADDITIVE)
+def globus_transfer(
+    source: str,
+    source_path: str,
+    dest: str,
+    dest_path: str,
+    recursive: bool = False,
+    sync_level: str = "mtime",
+    label: str = "",
+    dry_run: bool = False,
+    delete_destination_extra: bool = False,
+    confirm_destructive: bool = False,
+) -> str:
+    """Submit a Globus transfer between two collections and return its task ID.
+
+    This is the right tool for bulk data: both NSF NCAR and CU Boulder ask for
+    large transfers to go through Globus rather than scp over a login node.
+    The transfer runs on Globus's servers and continues after this call
+    returns; poll it with globus_task_status.
+
+    Args:
+        source: Source collection UUID or hosts.toml alias.
+        source_path: Absolute path on the source collection.
+        dest: Destination collection UUID or hosts.toml alias.
+        dest_path: Absolute path on the destination collection.
+        recursive: Required when transferring a directory.
+        sync_level: When to re-send a file that already exists at the
+            destination: exists, size, mtime (default) or checksum.
+        label: Task label shown in the Globus web app. Auto-generated if empty.
+        dry_run: Validate and show what would transfer without submitting.
+        delete_destination_extra: Delete files at the destination that are not
+            in the source (mirror). Destructive; needs confirm_destructive.
+        confirm_destructive: Set only after the user has confirmed deletion.
+    """
+    if not _globus_cli_available():
+        return _globus_unavailable()
+    if sync_level not in SYNC_LEVELS:
+        raise ValueError(f"Invalid sync_level: {sync_level!r}. Expected one of {', '.join(SYNC_LEVELS)}.")
+    if label and not _VALID_LABEL_RE.match(label):
+        raise ValueError(
+            f"Invalid label: {label!r}. Use letters, digits, spaces and . _ , : + - (max 128)."
+        )
+    src_uuid, dst_uuid = _resolve_collection(source), _resolve_collection(dest)
+    if src_uuid == dst_uuid and source_path == dest_path:
+        return "Source and destination are the same collection and path; nothing to transfer."
+    if delete_destination_extra and not confirm_destructive:
+        return (
+            "Refused pending confirmation: --delete-destination-extra permanently removes "
+            f"files under {dest_path} on the destination that are not in the source.\n"
+            "Ask the user to confirm, then call again with confirm_destructive=true."
+        )
+
+    args = ["transfer", f"{src_uuid}:{source_path}", f"{dst_uuid}:{dest_path}",
+            "--sync-level", sync_level,
+            "--label", label or f"hpc-ssh-mcp {time.strftime('%Y-%m-%d %H:%M')}"]
+    if recursive:
+        args.append("--recursive")
+    if dry_run:
+        args.append("--dry-run")
+    if delete_destination_extra:
+        args.append("--delete-destination-extra")
+
+    data, err = _globus_json(args)
+    if err:
+        return err
+    if not isinstance(data, dict):
+        return str(data)
+    task_id = data.get("task_id")
+    if not task_id:
+        return json.dumps(data, indent=2)[:MAX_OUTPUT_CHARS]
+    return (
+        f"{data.get('message', 'Transfer submitted')}\n"
+        f"task_id: {task_id}\n"
+        f"Poll it with globus_task_status('{task_id}'). The transfer continues on "
+        "Globus's servers whether or not this session stays open."
+    )
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def globus_task_status(task_id: str) -> str:
+    """Show the status of a Globus transfer task, with the last error if it failed.
+
+    Args:
+        task_id: Task UUID returned by globus_transfer.
+    """
+    if not _globus_cli_available():
+        return _globus_unavailable()
+    tid = _validate_task_id(task_id)
+    data, err = _globus_json(["task", "show", tid])
+    if err:
+        return err
+    if not isinstance(data, dict):
+        return str(data)
+    status = data.get("status", "UNKNOWN")
+    lines = [
+        f"status: {status}",
+        f"label: {data.get('label', '')}",
+        f"files transferred: {data.get('files_transferred', 0)}",
+        f"bytes transferred: {_human_bytes(data.get('bytes_transferred', 0))}",
+    ]
+    if status in ("FAILED", "INACTIVE"):
+        events, event_err = _globus_json(["task", "event-list", tid, "--limit", "5"])
+        if event_err:
+            lines.append(f"(could not read task events: {event_err})")
+        else:
+            rows = events if isinstance(events, list) else (events or {}).get("DATA", [])
+            for ev in rows[:5]:
+                lines.append(f"  {ev.get('code')}: {ev.get('details') or ev.get('description')}")
+        if status == "INACTIVE":
+            lines.append(f"\n{_LOGIN_STEPS}\n(an INACTIVE task usually means credentials expired)")
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=_OVERWRITES)
+def globus_task_cancel(task_id: str) -> str:
+    """Cancel a running Globus transfer task.
+
+    Files already transferred stay at the destination; the task stops moving
+    new ones.
+
+    Args:
+        task_id: Task UUID returned by globus_transfer.
+    """
+    if not _globus_cli_available():
+        return _globus_unavailable()
+    tid = _validate_task_id(task_id)
+    data, err = _globus_json(["task", "cancel", tid])
+    if err:
+        return err
+    if isinstance(data, dict):
+        return f"{data.get('code', 'Cancelled')}: {data.get('message', 'task cancelled')}"
+    return str(data)
 
 
 # ---------------------------------------------------------------------------

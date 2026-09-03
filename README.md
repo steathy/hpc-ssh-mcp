@@ -61,6 +61,12 @@ Add to your MCP config (e.g. `claude_desktop_config.json`):
 | `scp_download_file` | Download a file via `scp` |
 | `scp_upload_file` | Upload a file via `scp` |
 | `check_ssh_connection` | Verify the ControlMaster socket is alive |
+| `globus_status` | Which Globus identity this machine is logged in as |
+| `globus_find_collection` | Search Globus for a collection UUID by name |
+| `globus_ls` | List a directory on a Globus collection |
+| `globus_transfer` | Submit a Globus transfer and return its task ID |
+| `globus_task_status` | Status of a transfer task, with the last error if it failed |
+| `globus_task_cancel` | Cancel a running transfer task |
 
 Read-only tools carry the MCP `readOnlyHint`/`idempotentHint` annotations; `cancel_job`, the scp tools, `execute_remote_bash` and `run_on_compute` carry `destructiveHint`, so a client can auto-approve reads and confirm the rest.
 
@@ -84,6 +90,29 @@ The four job tools take `scheduler="auto"|"pbs"|"slurm"`. With `auto` the server
 Scheduler queries (`list_queue`, `check_job`) are rate-limited to one identical query per host every 30 seconds; a repeat inside that window returns the cached answer. Transfers over 2 GB get a note pointing at Globus or a data-transfer node.
 
 Paths: absolute paths are safest. `~/x` is expanded to the remote home directory in every path argument.
+
+### Globus transfers
+
+Both centers ask for bulk data to move through Globus rather than scp over a login node. The Globus CLI talks to the Globus API, not to a cluster, so these tools run it **locally**: no login node is touched and no SSH session is needed. It is an optional external tool, not a dependency of this package.
+
+Set it up once, in your own terminal (the server never handles your credentials):
+
+```bash
+uv tool install globus-cli
+globus login
+```
+
+Mapped collections (NCAR GLADE, NCAR Campaign Storage, CU Boulder Research Computing) also need a one-time `data_access` consent per collection. The CLI signals both a missing login and a missing consent with exit code 4; the tools translate that into the exact command to run, including the full consent scope string.
+
+Put the UUIDs you use often in `hosts.toml` so calls can name them:
+
+```toml
+[globus.collections]
+glade  = "d33b3614-…"
+alpine = "aa3b3614-…"
+```
+
+Then `globus_transfer(source="glade", source_path="/glade/work/me/run1", dest="alpine", dest_path="/scratch/alpine/me/run1", recursive=True)`. Transfers default to `--sync-level mtime`, so re-running one is idempotent. `--delete-destination-extra` requires `confirm_destructive=true`.
 
 ### Host profiles
 
@@ -113,9 +142,16 @@ The unit suite mocks `subprocess.run`; the live suite exists because several 1.1
 
 ## Version
 
-1.2.0
+1.3.0
 
 ## Changelog
+
+### 1.3.0
+
+- **Globus transfer tools**: `globus_status`, `globus_find_collection`, `globus_ls`, `globus_transfer`, `globus_task_status`, `globus_task_cancel`. See [Globus transfers](#globus-transfers).
+- The CLI runs locally with `GLOBUS_CLI_INTERACTIVE=0` and JSON output. Exit code 4 is translated into either the `globus login` steps or the exact `globus session consent` command with the collection's `data_access` scope.
+- Collection aliases come from `[globus.collections]` in `hosts.toml`; a bare UUID always works.
+- If the Globus CLI is not installed, every Globus tool says so and explains how to install and log in, rather than failing obscurely.
 
 ### 1.2.0
 

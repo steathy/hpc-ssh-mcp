@@ -372,9 +372,11 @@ class TestExecuteRemoteBashViaStdin:
 # ---------------------------------------------------------------------------
 
 class TestToolAnnotations:
-    READ_ONLY = {"read_remote_file", "tail_remote_file", "check_job", "list_queue", "check_ssh_connection"}
+    READ_ONLY = {"read_remote_file", "tail_remote_file", "check_job", "list_queue",
+                 "check_ssh_connection", "globus_status", "globus_find_collection",
+                 "globus_ls", "globus_task_status"}
     MUTATING = {"execute_remote_bash", "submit_job", "cancel_job", "run_on_compute",
-                "scp_download_file", "scp_upload_file"}
+                "scp_download_file", "scp_upload_file", "globus_transfer", "globus_task_cancel"}
 
     async def _tools(self):
         from fastmcp import Client

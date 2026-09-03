@@ -200,6 +200,31 @@ class TestBashExecution:
 # Protocol-level: MCP initialize + tools/list
 # ---------------------------------------------------------------------------
 
+SSH_TOOLS = {
+    "execute_remote_bash",
+    "submit_job",
+    "check_job",
+    "cancel_job",
+    "list_queue",
+    "run_on_compute",
+    "read_remote_file",
+    "tail_remote_file",
+    "scp_download_file",
+    "scp_upload_file",
+    "check_ssh_connection",
+}
+
+# The Globus CLI talks to the Globus API, not to a host, so these take no host.
+GLOBUS_TOOLS = {
+    "globus_status",
+    "globus_find_collection",
+    "globus_ls",
+    "globus_transfer",
+    "globus_task_status",
+    "globus_task_cancel",
+}
+
+
 class TestMCPProtocol:
     @pytest.mark.asyncio
     async def test_initialize_returns_server_info(self):
@@ -218,19 +243,7 @@ class TestMCPProtocol:
         from fastmcp import Client
         import ssh_hpc_server
 
-        expected_tools = {
-            "execute_remote_bash",
-            "submit_job",
-            "check_job",
-            "cancel_job",
-            "list_queue",
-            "run_on_compute",
-            "read_remote_file",
-            "tail_remote_file",
-            "scp_download_file",
-            "scp_upload_file",
-            "check_ssh_connection",
-        }
+        expected_tools = SSH_TOOLS | GLOBUS_TOOLS
 
         async with Client(ssh_hpc_server.mcp) as client:
             tools = await client.list_tools()
@@ -249,15 +262,18 @@ class TestMCPProtocol:
                 assert tool.description, f"Tool {tool.name} has no description"
 
     @pytest.mark.asyncio
-    async def test_each_tool_requires_host_parameter(self):
-        """Every tool must accept a 'host' parameter."""
+    async def test_ssh_tools_take_a_host_and_globus_tools_do_not(self):
+        """Every SSH tool is addressed by host; the Globus CLI is not."""
         from fastmcp import Client
         import ssh_hpc_server
 
         async with Client(ssh_hpc_server.mcp) as client:
-            tools = await client.list_tools()
-            for tool in tools:
-                schema = tool.inputSchema
-                assert "host" in schema.get("properties", {}), (
-                    f"Tool {tool.name} missing 'host' parameter"
-                )
+            tools = {t.name: t for t in await client.list_tools()}
+        for name in SSH_TOOLS:
+            assert "host" in tools[name].inputSchema.get("properties", {}), (
+                f"Tool {name} missing 'host' parameter"
+            )
+        for name in GLOBUS_TOOLS:
+            assert "host" not in tools[name].inputSchema.get("properties", {}), (
+                f"Globus tool {name} should not take a 'host'"
+            )

@@ -34,3 +34,10 @@ scratch = "/scratch/alpine/$USER"         # CURC purges scratch after 90 days
 # without needing allow_on_login_node. Destructive commands are still guarded.
 [my-workstation]
 role = "workstation"
+
+# Globus collection aliases, so tools can say "glade" instead of a UUID.
+# Find UUIDs with globus_find_collection("NCAR GLADE").
+[globus.collections]
+glade    = "00000000-0000-0000-0000-000000000000"  # NCAR GLADE
+campaign = "00000000-0000-0000-0000-000000000000"  # NCAR Campaign Storage
+alpine   = "00000000-0000-0000-0000-000000000000"  # CU Boulder Research Computing
