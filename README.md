@@ -426,7 +426,6 @@ Host settings come from one place: `~/.config/hpc-ssh-mcp/hosts.json`. 1.7.0 sto
 Also in 1.9.0, from the same review:
 
 - **A quoted argument is one token.** `grep -n 'rm -rf /' notes.md` and `grep -r "temperature in /glade" mydir/` were *blocked*: the policy split on whitespace, so a quoted search pattern supplied its own `-r` and its own path. That is a false positive in the one tier with no override.
-- **Recursive traversal at a shared root is blocked from any node**, not just a login node. A metadata storm is a property of the filesystem, not of the node that starts it, and `run_on_compute` already honoured every other block-tier rule.
 - **A timed-out command says the remote command is still running.** The timeout kills the local `ssh`; with no TTY the remote side keeps going. Saying only "Timed out" invited a retry that stacked orphans on the shared node. The live suite proves the warning is true by watching the command finish after the client gave up.
 - **`check_ssh_connection` explains a host with no `ControlPath`** instead of returning a bare exit 255. Not multiplexing is the normal state of a host that does not need MFA.
 - **The output cap is a cap.** `stdout` and `stderr` were each truncated to 200 KB and then joined, so a failing command could return 400 KB.

@@ -912,10 +912,12 @@ def _tar_tier(segment: str) -> tuple[str, str] | None:
 
 _CALLABLE_RULES = (
     (_rm_tier, None),
-    # Not role-gated: a metadata storm is a property of the shared filesystem,
-    # not of the node that starts it, and run_on_compute already honours every
-    # other block-tier rule.
-    (_traversal_tier, None),
+    # Login-node etiquette, not an absolute prohibition. Applying it on a compute
+    # node too was tried and reverted: `block` has no override in strict mode, so
+    # it made a traversal unreachable through this server from anywhere rather
+    # than merely discouraged, and run_on_compute is the sanctioned route for
+    # heavy work. Where to run one is the user's call to make.
+    (_traversal_tier, _LOGIN_ROLES),
     (_unbounded_parallelism_tier, _LOGIN_ROLES),
     (_interpreter_tier, _LOGIN_ROLES),
     (_compiler_tier, _LOGIN_ROLES),

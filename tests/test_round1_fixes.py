@@ -312,27 +312,44 @@ class TestQuotedArgumentsAreOneToken:
 
 
 # ---------------------------------------------------------------------------
-# F7: a metadata storm is a filesystem property, not a node property
+# F7 (reverted): the traversal rule is login-node etiquette
 # ---------------------------------------------------------------------------
-# _traversal_tier was gated to login/dtn, so run_on_compute (role='compute')
-# let `find /glade` through. The shared metadata servers are hit identically
-# from a compute node, and run_on_compute already honours every other block.
+# The review found the rule gated to login/dtn while the docs called it an
+# absolute prohibition, and proposed either widening the rule or correcting the
+# docs. Widening it was tried and reverted: `block` has no override in strict
+# mode, so applying it on a compute node did not discourage a traversal, it made
+# one unreachable through this server from anywhere. run_on_compute is the
+# sanctioned route for heavy work and has to stay usable. The docs are what
+# moved: this is login-node etiquette.
 
-class TestTraversalIsBlockedFromAnyRole:
-    @pytest.mark.parametrize("role", ["login", "dtn", "compute"])
-    def test_shared_root_traversal_blocks_everywhere(self, role):
+class TestTraversalIsLoginNodeEtiquette:
+    @pytest.mark.parametrize("role", ["login", "dtn"])
+    def test_shared_root_traversal_blocks_on_a_shared_entry_point(self, role):
         tier, _ = ssh_hpc_server._classify_command("find /glade -name '*.nc'", role)
         assert tier == "block", role
 
+    def test_a_compute_node_is_the_users_own_call(self):
+        """Deliberately routing it to a compute node is a considered choice, and
+        the only path left once `block` refuses it everywhere else."""
+        tier, _ = ssh_hpc_server._classify_command("find /glade -name '*.nc'", "compute")
+        assert tier == "free"
+
     @pytest.mark.parametrize("role", ["login", "dtn", "compute"])
-    def test_your_own_subdirectory_is_still_free(self, role):
+    def test_your_own_subdirectory_is_free_everywhere(self, role):
         tier, _ = ssh_hpc_server._classify_command("find /glade/work/me -name '*.nc'", role)
         assert tier == "free", role
 
-    def test_run_on_compute_refuses_it(self, mock_subprocess):
+    def test_run_on_compute_runs_it(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="4.0K\n")
         result = ssh_hpc_server.run_on_compute(
             host="derecho", command="du -sh /glade", account="UABC0001", scheduler="pbs",
         )
+        assert "Blocked by policy" not in result
+        mock_subprocess.assert_called_once()
+
+    def test_execute_remote_bash_still_refuses_it(self, mock_subprocess):
+        """The login node is where the etiquette applies, and there it holds."""
+        result = ssh_hpc_server.execute_remote_bash(host="derecho", command="du -sh /glade")
         assert "Blocked by policy" in result
         mock_subprocess.assert_not_called()
 
