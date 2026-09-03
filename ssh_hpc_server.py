@@ -19,6 +19,13 @@ __version__ = "1.0.0"
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
 DEFAULT_TIMEOUT = 120
+# Bulk transfers are slow by nature; a 120 s cap silently truncated large files.
+DEFAULT_SCP_TIMEOUT = 3600
+
+# ssh reserves exit status 255 for its own failures (connection, auth, control
+# socket). Any other status belongs to the remote command, whose stderr must not
+# be mistaken for a session problem.
+SSH_OWN_FAILURE_RC = 255
 
 # Applied to every ssh/scp invocation that actually opens a connection.
 # BatchMode=yes:    refuse interactive auth (password, keyboard-interactive/MFA);
@@ -48,6 +55,11 @@ def _validate_host(host: str) -> None:
         )
 
 
+def _validate_timeout(timeout: int) -> None:
+    if timeout is None or timeout < 1:
+        raise ValueError(f"timeout must be a positive number of seconds, got {timeout!r}")
+
+
 def _run_raw(
     cmd: list[str],
     timeout: int = DEFAULT_TIMEOUT,
@@ -56,14 +68,21 @@ def _run_raw(
     """Execute a subprocess and return (returncode, stdout, stderr).
 
     Never raises on non-zero exit. Returns -1 for timeouts or missing binaries.
+
+    stdin is /dev/null unless input_data is given: the server's own stdin is
+    the MCP JSON-RPC stream, and ssh forwards whatever it inherits to the
+    remote command. Output is decoded as UTF-8 with replacement so a stray
+    Latin-1 byte in a log cannot turn into an exception.
     """
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             input=input_data,
+            stdin=None if input_data is not None else subprocess.DEVNULL,
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired as exc:
@@ -150,7 +169,7 @@ def _run_ssh(
     """Run a remote command over ssh and append a diagnostic hint on failure."""
     rc, out, err = _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
     formatted = _format_result(rc, out, err)
-    if rc != 0:
+    if rc == SSH_OWN_FAILURE_RC:
         formatted += _diagnose_ssh_failure(host, err)
     return formatted
 
@@ -165,11 +184,15 @@ def _run_ssh_raw(
     return _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
 
 
-def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_TIMEOUT) -> str:
-    """Run scp and append a diagnostic hint on failure (host used only for the hint)."""
+def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT) -> str:
+    """Run scp and append a diagnostic hint on failure (host used only for the hint).
+
+    scp propagates ssh's 255 when the connection itself fails, so the same
+    gate applies.
+    """
     rc, out, err = _run_raw(_scp_cmd(*scp_args), timeout=timeout)
     formatted = _format_result(rc, out, err)
-    if rc != 0:
+    if rc == SSH_OWN_FAILURE_RC:
         formatted += _diagnose_ssh_failure(host, err)
     return formatted
 
@@ -195,6 +218,7 @@ def execute_remote_bash(
         timeout: Max seconds to wait (default 120).
     """
     _validate_host(host)
+    _validate_timeout(timeout)
     return _run_ssh(host, f"bash -c {shlex.quote(command)}", timeout=timeout)
 
 
@@ -228,7 +252,9 @@ def submit_slurm_job(
     )
     if rc != 0:
         msg = f"Failed to write script to {remote_filename}:\n{_format_result(rc, out, err)}"
-        return msg + _diagnose_ssh_failure(host, err)
+        if rc == SSH_OWN_FAILURE_RC:
+            msg += _diagnose_ssh_failure(host, err)
+        return msg
 
     return _run_ssh(host, f"sbatch -- {safe_fn}")
 
@@ -362,6 +388,7 @@ def scp_download_file(
     host: str,
     remote_path: str,
     local_path: str,
+    timeout: int = DEFAULT_SCP_TIMEOUT,
 ) -> str:
     """Download a file from a remote host to the local machine via scp.
 
@@ -372,11 +399,13 @@ def scp_download_file(
         host: SSH config alias or hostname.
         remote_path: Path to the file on the remote host.
         local_path: Destination path on the local machine.
+        timeout: Max seconds to wait for the transfer (default 3600).
     """
     _validate_host(host)
+    _validate_timeout(timeout)
     # shlex.quote the remote path for the remote shell that scp invokes
     escaped_remote = shlex.quote(remote_path)
-    return _run_scp(host, [f"{host}:{escaped_remote}", local_path])
+    return _run_scp(host, [f"{host}:{escaped_remote}", local_path], timeout=timeout)
 
 
 @mcp.tool()
@@ -384,6 +413,7 @@ def scp_upload_file(
     host: str,
     local_path: str,
     remote_path: str,
+    timeout: int = DEFAULT_SCP_TIMEOUT,
 ) -> str:
     """Upload a file from the local machine to a remote host via scp.
 
@@ -393,10 +423,12 @@ def scp_upload_file(
         host: SSH config alias or hostname.
         local_path: Path to the file on the local machine.
         remote_path: Destination path on the remote host.
+        timeout: Max seconds to wait for the transfer (default 3600).
     """
     _validate_host(host)
+    _validate_timeout(timeout)
     escaped_remote = shlex.quote(remote_path)
-    return _run_scp(host, [local_path, f"{host}:{escaped_remote}"])
+    return _run_scp(host, [local_path, f"{host}:{escaped_remote}"], timeout=timeout)
 
 
 @mcp.tool()
@@ -410,7 +442,12 @@ def check_ssh_connection(host: str) -> str:
         host: SSH config alias or hostname.
     """
     _validate_host(host)
-    return _run(["ssh", "-O", "check", host])
+    # `ssh -O check` is a local socket query: no SSH_OPTS. OpenSSH prints the
+    # verdict ("Master running (pid=N)") on stderr, not stdout.
+    rc, out, err = _run_raw(["ssh", "-O", "check", host])
+    if rc == 0:
+        return err.strip() or out.strip() or "Master running"
+    return _format_result(rc, out, err) + _diagnose_ssh_failure(host, err)
 
 
 # ---------------------------------------------------------------------------
