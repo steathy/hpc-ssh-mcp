@@ -5,6 +5,9 @@ description = "SSH & HPC Remote Control MCP Server — universal bridge to SSH-e
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp>=3,<4",
+    # Imported directly for ToolAnnotations, so declared directly rather than
+    # relied on as a transitive dependency of fastmcp.
+    "mcp>=1.9",
 ]
 
 [tool.hatch.build.targets.wheel]

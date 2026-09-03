@@ -81,6 +81,19 @@ class TestLiveShell:
         assert "real-output" in out
         assert "WARNING: module not found" in out, out
 
+    def test_a_timed_out_command_really_does_survive(self, remote_dir):
+        """Round 1 F8: the timeout kills the local ssh, not the remote command.
+        The warning has to be true, so prove the command ran to completion after
+        we had already given up on it."""
+        import time
+        proof = f"{remote_dir}/finished-after-the-timeout"
+        out = execute_remote_bash(HOST, f"sleep 5; touch '{proof}'", timeout=2)
+        assert "Timed out after 2s" in out
+        assert "NOT stopped" in out, out
+        time.sleep(6)
+        listing = execute_remote_bash(HOST, f"ls '{proof}' 2>/dev/null || echo absent")
+        assert "absent" not in listing, "the warning claims an orphan; there was none"
+
     def test_remote_failure_text_gets_no_reauth_hint(self):
         out = execute_remote_bash(HOST, "echo 'Permission denied (publickey).' >&2; exit 3")
         assert "[EXIT CODE 3]" in out

@@ -10,8 +10,12 @@ def isolate_host_store(tmp_path, monkeypatch):
     import ssh_hpc_server
     monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "isolated-hosts.json"))
     ssh_hpc_server._STORE_CACHE = None
+    # Leaking this made any assertion on tool output depend on test order: the
+    # first-use notice appears once per host per *process*, not per test.
+    ssh_hpc_server._ONBOARDING_SEEN.clear()
     yield
     ssh_hpc_server._STORE_CACHE = None
+    ssh_hpc_server._ONBOARDING_SEEN.clear()
 
 
 @pytest.fixture

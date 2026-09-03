@@ -423,6 +423,17 @@ Host settings come from one place: `~/.config/hpc-ssh-mcp/hosts.json`. 1.7.0 sto
 - **The policy refusal no longer names a tool.** It points at the settings file and `HPC_SSH_MCP_POLICY`, so the escape stays the human's.
 - **`account` is documented as `run_on_compute` only**, which is all it ever was; `submit_job` takes the account from the `#PBS -A` / `#SBATCH --account` line in your script.
 
+Also in 1.9.0, from the same review:
+
+- **A quoted argument is one token.** `grep -n 'rm -rf /' notes.md` and `grep -r "temperature in /glade" mydir/` were *blocked*: the policy split on whitespace, so a quoted search pattern supplied its own `-r` and its own path. That is a false positive in the one tier with no override.
+- **Recursive traversal at a shared root is blocked from any node**, not just a login node. A metadata storm is a property of the filesystem, not of the node that starts it, and `run_on_compute` already honoured every other block-tier rule.
+- **A timed-out command says the remote command is still running.** The timeout kills the local `ssh`; with no TTY the remote side keeps going. Saying only "Timed out" invited a retry that stacked orphans on the shared node. The live suite proves the warning is true by watching the command finish after the client gave up.
+- **`check_ssh_connection` explains a host with no `ControlPath`** instead of returning a bare exit 255. Not multiplexing is the normal state of a host that does not need MFA.
+- **The output cap is a cap.** `stdout` and `stderr` were each truncated to 200 KB and then joined, so a failing command could return 400 KB.
+- **The `authorized_keys` rule is anchored to a path component.** `echo hi > my_authorized_keys_notes.txt` was blocked.
+- **Walltimes accept Slurm's `D-HH:MM:SS`**, so a job longer than a day can be asked for.
+- **Housekeeping:** expired scheduler-poll entries are dropped rather than kept for the session; the settings file is written through a unique temporary name, so two concurrent writers cannot collide; `mcp` is declared as the direct dependency it is.
+
 ### 1.8.0
 
 - **The settings file is JSON**, at `~/.config/hpc-ssh-mcp/hosts.json`. It is machine-written and machine-read, so it uses a format with a parser that already exists instead of a line syntax invented here. `hpc` is a real boolean. Hand-written annotations stay in `~/.ssh/config`, and still win.

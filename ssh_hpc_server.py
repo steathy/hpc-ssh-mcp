@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 
@@ -42,6 +43,16 @@ LARGE_TRANSFER_BYTES = 2_000_000_000
 # be mistaken for a session problem.
 SSH_OWN_FAILURE_RC = 255
 
+# A timeout kills the *local* ssh client. With no TTY the remote command does
+# not reliably get a signal, so it keeps running -- and a message that says only
+# "Timed out" invites a retry that stacks orphans on the shared node this
+# server's whole policy exists to protect. Say so instead.
+_TIMEOUT_ORPHAN_NOTE = (
+    "\nThe remote command was NOT stopped and is probably still running: only the local "
+    "ssh client was killed. Check with execute_remote_bash(host, 'pgrep -au $USER') before "
+    "retrying, and stop it there if it is still going."
+)
+
 # Applied to every ssh/scp invocation that actually opens a connection.
 # BatchMode=yes:    refuse interactive auth (password, keyboard-interactive/MFA);
 #                   MCP servers have no TTY, so interactive auth would otherwise
@@ -63,7 +74,8 @@ _VALID_HOST_RE = re.compile(r"^[a-zA-Z0-9._@-]+$")
 _VALID_SLURM_JOB_ID_RE = re.compile(r"^\d+([_.]\d+)*$")
 _VALID_PBS_JOB_ID_RE = re.compile(r"^\d+(\[\d*\])?(\.[A-Za-z0-9.-]+)?$")
 _VALID_DIRECTIVE_RE = re.compile(r"^[A-Za-z0-9_.:=,+-]+$")  # account, queue, -l select strings
-_VALID_WALLTIME_RE = re.compile(r"^\d{1,3}:\d{2}:\d{2}$")
+# HH:MM:SS, or Slurm's D-HH:MM:SS for anything past a day.
+_VALID_WALLTIME_RE = re.compile(r"^(?:\d{1,3}-)?\d{1,3}:\d{2}:\d{2}$")
 _VALID_USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _OPENSSH_VERSION_RE = re.compile(r"OpenSSH_(\d+)\.(\d+)")
 
@@ -190,7 +202,7 @@ def _run_raw(
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode(errors="replace")
         stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
-        return -1, stdout, f"Timed out after {timeout}s. {stderr}"
+        return -1, stdout, f"Timed out after {timeout}s. {stderr}{_TIMEOUT_ORPHAN_NOTE}"
     except FileNotFoundError:
         return -1, "", f"Command not found: {cmd[0]}. Is it installed and on PATH?"
 
@@ -213,16 +225,20 @@ def _format_result(returncode: int, stdout: str, stderr: str) -> str:
     if returncode == 0:
         parts = []
         if stdout.strip():
-            parts.append(_truncate(stdout, MAX_OUTPUT_CHARS))
+            parts.append(stdout)
         if stderr.strip():
-            parts.append(f"stderr:\n{_truncate(stderr.rstrip(), MAX_OUTPUT_CHARS)}")
-        return "\n".join(parts) if parts else "(no output)"
-    parts = [f"[EXIT CODE {returncode}]"]
-    if stdout.strip():
-        parts.append(f"stdout:\n{_truncate(stdout.rstrip(), MAX_OUTPUT_CHARS)}")
-    if stderr.strip():
-        parts.append(f"stderr:\n{_truncate(stderr.rstrip(), MAX_OUTPUT_CHARS)}")
-    return "\n".join(parts)
+            parts.append(f"stderr:\n{stderr.rstrip()}")
+        if not parts:
+            return "(no output)"
+    else:
+        parts = [f"[EXIT CODE {returncode}]"]
+        if stdout.strip():
+            parts.append(f"stdout:\n{stdout.rstrip()}")
+        if stderr.strip():
+            parts.append(f"stderr:\n{stderr.rstrip()}")
+    # One cap on what is returned. Truncating each stream to MAX_OUTPUT_CHARS
+    # and then joining them meant a failing command could return twice it.
+    return _truncate("\n".join(parts), MAX_OUTPUT_CHARS)
 
 
 def _run(
@@ -262,6 +278,13 @@ def _diagnose_ssh_failure(host: str, stderr: str) -> str:
             f"\n\nHint: SSH auth failed for {host!r}. The ControlMaster socket has likely "
             f"expired, so a new connection was attempted and rejected because this server "
             f"cannot answer interactive MFA prompts.\n{reauth}\nThen retry."
+        )
+    if "no controlpath specified" in s:
+        return (
+            f"\n\nHint: {host!r} has no ControlPath configured, so its connections are not "
+            "multiplexed. That is fine for a host that does not need MFA -- commands will "
+            "just open a new connection each time. To reuse one pre-authenticated session, "
+            "add ControlMaster/ControlPath/ControlPersist to its ~/.ssh/config block."
         )
     if "control socket connect" in s or ("control path" in s and "no such file" in s):
         return (
@@ -468,13 +491,21 @@ def _write_store(entries: dict) -> str | None:
     path = _store_path()
     document = {"_note": _STORE_NOTE, "hosts": dict(sorted(entries.items()))}
     try:
-        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
-        temp = f"{path}.tmp"
-        handle = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(handle, "w", encoding="utf-8") as fh:
-            json.dump(document, fh, indent=2, sort_keys=False)
-            fh.write("\n")
-        os.replace(temp, path)
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        # A unique temp name: FastMCP runs sync tools in a thread pool, so two
+        # concurrent record_host calls shared one fixed "<path>.tmp".
+        handle, temp = tempfile.mkstemp(dir=directory, prefix=".hosts-", suffix=".tmp")
+        try:
+            os.fchmod(handle, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                json.dump(document, fh, indent=2, sort_keys=False)
+                fh.write("\n")
+            os.replace(temp, path)
+        except BaseException:
+            if os.path.exists(temp):
+                os.remove(temp)
+            raise
     except OSError as exc:
         return f"Could not write {path}: {exc}"
     return None
@@ -582,6 +613,9 @@ def _cached_poll(key: tuple, produce) -> str:
     limiting -- so the obvious reading was that the fix had not worked.
     """
     now = time.monotonic()
+    for stale in [k for k, (ts, _) in _POLL_CACHE.items()
+                  if now - ts >= SCHEDULER_POLL_INTERVAL]:
+        del _POLL_CACHE[stale]  # an expired answer is dead weight, not a cache
     hit = _POLL_CACHE.get(key)
     if hit and now - hit[0] < SCHEDULER_POLL_INTERVAL:
         age = int(now - hit[0])
@@ -644,7 +678,7 @@ _SEGMENT_RULES = (
      "system package manager (use conda/spack in your own space)", None),
     (re.compile(r"^mkfs(?:\.\w+)?\s"), "block", "mkfs (filesystem creation)", None),
     (re.compile(r"^dd\b[^|]*\bof=/dev/"), "block", "dd writing to a device node", None),
-    (re.compile(r"(?:>>?\s*|tee\s+(?:-a\s+)?)\S*authorized_keys"), "block",
+    (re.compile(r"(?:>>?\s*|tee\s+(?:-a\s+)?)(?:\S*/)?authorized_keys(?:\s|$)"), "block",
      "write to authorized_keys (SSH key persistence)", None),
     (re.compile(r"^sed\s+-i\b[^;]*authorized_keys"), "block",
      "in-place edit of authorized_keys (SSH key persistence)", None),
@@ -707,12 +741,28 @@ _PATTERN_FIRST = ("grep", "egrep", "fgrep", "rg", "ripgrep")
 _NEEDS_RECURSIVE_FLAG = ("ls", "grep", "egrep", "fgrep")
 
 
+def _tokens(segment: str) -> list[str]:
+    """Split a segment the way the shell will, so a quoted argument stays one token.
+
+    Splitting on whitespace tore a quoted *search pattern* apart and read its
+    fragments as flags and paths: `grep -n 'rm -rf /' notes.md` supplied its own
+    -r and its own "/". Unbalanced quotes are not our problem to resolve -- fall
+    back rather than raise.
+    """
+    try:
+        return shlex.split(segment)
+    except ValueError:
+        return segment.split()
+
+
 def _traversal_tier(segment: str) -> tuple[str, str] | None:
     """Block find/du/ls -R/grep -r/rg at or above a shared filesystem root."""
     m = _TRAVERSAL_RE.match(segment)
     if not m:
         return None
-    tokens = segment.split()
+    tokens = _tokens(segment)
+    if not tokens:
+        return None
     name = "lfs find" if tokens[0] == "lfs" else tokens[0]
     args = tokens[2:] if name == "lfs find" else tokens[1:]
 
@@ -801,7 +851,7 @@ def _rm_tier(segment: str) -> tuple[str, str] | None:
         return None
     recursive = False
     paths, end_of_flags = [], False
-    for tok in m.group("rest").split():
+    for tok in _tokens(m.group("rest")):
         if tok == "--":
             end_of_flags = True
             continue
@@ -862,7 +912,10 @@ def _tar_tier(segment: str) -> tuple[str, str] | None:
 
 _CALLABLE_RULES = (
     (_rm_tier, None),
-    (_traversal_tier, _LOGIN_ROLES),
+    # Not role-gated: a metadata storm is a property of the shared filesystem,
+    # not of the node that starts it, and run_on_compute already honours every
+    # other block-tier rule.
+    (_traversal_tier, None),
     (_unbounded_parallelism_tier, _LOGIN_ROLES),
     (_interpreter_tier, _LOGIN_ROLES),
     (_compiler_tier, _LOGIN_ROLES),
@@ -1074,7 +1127,8 @@ def submit_job(
     Args:
         host: SSH config alias for the HPC system.
         job_script_content: Full text of the batch script, including directives.
-        remote_filename: Script name on the remote host. Auto-generated if empty.
+        remote_filename: Script name on the remote host. Auto-generated (unique) if
+            empty; an explicit name overwrites any existing file of that name.
         remote_dir: Directory to write to and submit from (created if missing).
             Defaults to the SSH login directory, usually $HOME.
         scheduler: 'auto' (detect once per host), 'pbs' or 'slurm'.

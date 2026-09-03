@@ -393,6 +393,7 @@ version = "1.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "mcp" },
 ]
 
 [package.optional-dependencies]
@@ -404,6 +405,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=3,<4" },
+    { name = "mcp", specifier = ">=1.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
 ]

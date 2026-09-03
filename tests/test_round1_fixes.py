@@ -271,3 +271,253 @@ class TestPartialAnnotationKeepsTheRest:
         ssh_hpc_server.record_host("alpine", center="curc", account="ucb999")
         ssh_hpc_server.record_host("derecho", center="ncar")
         assert ssh_hpc_server._host_settings("alpine")["account"] == "ucb999"
+
+
+# ---------------------------------------------------------------------------
+# F6: a quoted argument is one token
+# ---------------------------------------------------------------------------
+# _traversal_tier and _rm_tier split on whitespace, so a quoted *search
+# pattern* was torn apart and its fragments read as flags and paths. Grepping
+# your own notes for a dangerous command was blocked -- in the one tier with no
+# override, which is the failure this project explicitly prefers to avoid.
+
+class TestQuotedArgumentsAreOneToken:
+    @pytest.mark.parametrize("command", [
+        "grep -n 'rm -rf /' notes.md",
+        'grep -r "temperature in /glade" mydir/',
+        'grep -rn "du -sh /scratch" notes/',
+    ])
+    def test_a_quoted_pattern_is_not_read_as_a_path(self, command):
+        tier, rule = ssh_hpc_server._classify_command(command, "login")
+        assert tier == "free", f"{tier}: {rule}"
+
+    @pytest.mark.parametrize("command", [
+        "grep -r pattern /glade",
+        "find /glade -name '*.nc'",
+        "du -sh /scratch",
+        "ls -R /",
+        "rg needle /projects",
+        "grep -r needle '/glade'",
+    ])
+    def test_real_traversals_still_block(self, command):
+        assert ssh_hpc_server._classify_command(command, "login")[0] == "block", command
+
+    def test_unbalanced_quotes_fall_back_instead_of_raising(self):
+        tier, _ = ssh_hpc_server._classify_command("grep -r 'unclosed /glade", "login")
+        assert tier in ("free", "block")  # must not raise
+
+    def test_a_quoted_rm_target_is_still_seen(self):
+        tier, _ = ssh_hpc_server._classify_command('rm -rf "$HOME"', "login")
+        assert tier == "block"
+
+
+# ---------------------------------------------------------------------------
+# F7: a metadata storm is a filesystem property, not a node property
+# ---------------------------------------------------------------------------
+# _traversal_tier was gated to login/dtn, so run_on_compute (role='compute')
+# let `find /glade` through. The shared metadata servers are hit identically
+# from a compute node, and run_on_compute already honours every other block.
+
+class TestTraversalIsBlockedFromAnyRole:
+    @pytest.mark.parametrize("role", ["login", "dtn", "compute"])
+    def test_shared_root_traversal_blocks_everywhere(self, role):
+        tier, _ = ssh_hpc_server._classify_command("find /glade -name '*.nc'", role)
+        assert tier == "block", role
+
+    @pytest.mark.parametrize("role", ["login", "dtn", "compute"])
+    def test_your_own_subdirectory_is_still_free(self, role):
+        tier, _ = ssh_hpc_server._classify_command("find /glade/work/me -name '*.nc'", role)
+        assert tier == "free", role
+
+    def test_run_on_compute_refuses_it(self, mock_subprocess):
+        result = ssh_hpc_server.run_on_compute(
+            host="derecho", command="du -sh /glade", account="UABC0001", scheduler="pbs",
+        )
+        assert "Blocked by policy" in result
+        mock_subprocess.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F16: the authorized_keys rule matched any filename containing the word
+# ---------------------------------------------------------------------------
+
+class TestAuthorizedKeysRuleIsAnchored:
+    @pytest.mark.parametrize("command", [
+        "echo hi > my_authorized_keys_notes.txt",
+        "echo hi > notes-about-authorized_keys.md",
+    ])
+    def test_a_file_merely_named_after_it_is_free(self, command):
+        assert ssh_hpc_server._classify_command(command, "login")[0] == "free", command
+
+    @pytest.mark.parametrize("command", [
+        "echo k >> ~/.ssh/authorized_keys",
+        "echo k > /home/u/.ssh/authorized_keys",
+        "tee -a /home/u/.ssh/authorized_keys",
+        "echo k >>authorized_keys",
+    ])
+    def test_the_real_thing_still_blocks(self, command):
+        assert ssh_hpc_server._classify_command(command, "login")[0] == "block", command
+
+
+# ---------------------------------------------------------------------------
+# F15: the output cap is a cap on what is returned
+# ---------------------------------------------------------------------------
+# stdout and stderr were each truncated to MAX_OUTPUT_CHARS and then joined,
+# so a failing command could return twice the documented cap.
+
+class TestOutputCapIsWhatItSays:
+    def test_both_streams_together_stay_within_the_cap(self):
+        big = "x" * (ssh_hpc_server.MAX_OUTPUT_CHARS * 2)
+        result = _format_result(1, big, big)
+        assert len(result) <= ssh_hpc_server.MAX_OUTPUT_CHARS + 200, len(result)
+
+    def test_success_with_a_huge_stderr_is_capped_too(self):
+        big = "x" * (ssh_hpc_server.MAX_OUTPUT_CHARS * 2)
+        result = _format_result(0, big, big)
+        assert len(result) <= ssh_hpc_server.MAX_OUTPUT_CHARS + 200, len(result)
+
+    def test_it_says_it_truncated(self):
+        big = "x" * (ssh_hpc_server.MAX_OUTPUT_CHARS * 2)
+        assert "truncated" in _format_result(1, big, big)
+
+    def test_small_output_is_untouched(self):
+        assert _format_result(0, "hi\n", "") == "hi\n"
+        assert "[EXIT CODE 1]" in _format_result(1, "out", "err")
+
+
+# ---------------------------------------------------------------------------
+# F8: a timed-out command is still running on the login node
+# ---------------------------------------------------------------------------
+# subprocess kills the *local* ssh client. Without a TTY the remote command
+# keeps going, so "Timed out" invited a retry that stacked orphans on exactly
+# the shared node this server's whole policy exists to protect.
+
+class TestTimeoutSaysTheRemoteCommandSurvives:
+    def test_the_message_warns_about_the_orphan(self, mock_subprocess):
+        import subprocess as sp
+        mock_subprocess.side_effect = sp.TimeoutExpired(cmd=["ssh"], timeout=3, output="start\n")
+        result = ssh_hpc_server.execute_remote_bash(
+            host="derecho", command="sleep 300", timeout=3,
+        )
+        assert "Timed out after 3s" in result
+        lowered = result.lower()
+        assert "not stopped" in lowered or "still running" in lowered, result
+        assert "pgrep" in result  # and how to find it
+
+    def test_partial_output_is_kept(self, mock_subprocess):
+        import subprocess as sp
+        mock_subprocess.side_effect = sp.TimeoutExpired(cmd=["ssh"], timeout=3, output="start\n")
+        assert "start" in ssh_hpc_server.execute_remote_bash(
+            host="derecho", command="sleep 300", timeout=3,
+        )
+
+
+# ---------------------------------------------------------------------------
+# F14: a host with no ControlPath is not a broken host
+# ---------------------------------------------------------------------------
+
+class TestNoControlPathIsExplained:
+    def test_the_verdict_is_interpreted(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=255, stderr='No ControlPath specified for "-O" command\n',
+        )
+        result = ssh_hpc_server.check_ssh_connection(host="venus")
+        assert "ControlPath" in result
+        assert "multiplex" in result.lower()
+
+    def test_a_live_master_still_reports_plainly(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=0, stderr="Master running (pid=1234)\n",
+        )
+        assert ssh_hpc_server.check_ssh_connection(host="derecho") == "Master running (pid=1234)"
+
+
+# ---------------------------------------------------------------------------
+# F17: housekeeping
+# ---------------------------------------------------------------------------
+
+class TestPollCacheDoesNotGrowForever:
+    def test_expired_entries_are_dropped(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
+        ssh_hpc_server.list_queue(host="a", user="me", scheduler="slurm")
+        ssh_hpc_server.list_queue(host="b", user="me", scheduler="slurm")
+        assert len(ssh_hpc_server._POLL_CACHE) == 2
+        # Age both entries past the window.
+        stale = ssh_hpc_server.SCHEDULER_POLL_INTERVAL + 1
+        ssh_hpc_server._POLL_CACHE = {
+            k: (ts - stale, v) for k, (ts, v) in ssh_hpc_server._POLL_CACHE.items()
+        }
+        ssh_hpc_server.list_queue(host="c", user="me", scheduler="slurm")
+        assert len(ssh_hpc_server._POLL_CACHE) == 1, ssh_hpc_server._POLL_CACHE
+
+    def test_a_live_entry_is_not_dropped(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok")
+        ssh_hpc_server.list_queue(host="a", user="me", scheduler="slurm")
+        ssh_hpc_server.list_queue(host="b", user="me", scheduler="slurm")
+        assert "cached" in ssh_hpc_server.list_queue(host="a", user="me", scheduler="slurm")
+
+
+class TestStoreWriteHasNoFixedTempName:
+    def test_two_writers_cannot_collide_on_one_temp_path(self, tmp_path, monkeypatch):
+        """FastMCP runs sync tools in a thread pool, so `f"{path}.tmp"` was a race."""
+        import inspect
+        source = inspect.getsource(ssh_hpc_server._write_store)
+        assert 'f"{path}.tmp"' not in source, source
+        assert "mkstemp" in source, source
+
+    def test_the_store_is_still_written_privately_and_atomically(self, tmp_path, monkeypatch):
+        target = tmp_path / "nested" / "hosts.json"
+        monkeypatch.setenv("HPC_SSH_MCP_STORE", str(target))
+        ssh_hpc_server._STORE_CACHE = None
+        assert ssh_hpc_server._write_store({"h": {"center": "ncar"}}) is None
+        assert oct(target.stat().st_mode)[-3:] == "600"
+        assert [p.name for p in target.parent.iterdir()] == ["hosts.json"]
+
+
+class TestWalltimeAcceptsSlurmDayFormat:
+    @pytest.mark.parametrize("walltime", ["00:30:00", "12:00:00", "240:00:00",
+                                          "1-00:00:00", "2-12:30:00"])
+    def test_accepted(self, walltime):
+        ssh_hpc_server._validate_directive(
+            "walltime", walltime, ssh_hpc_server._VALID_WALLTIME_RE,
+        )
+
+    @pytest.mark.parametrize("walltime", ["30:00", "1:2:3:4", "abc", "1-2", "; rm -rf /"])
+    def test_rejected(self, walltime):
+        with pytest.raises(ValueError, match="walltime"):
+            ssh_hpc_server._validate_directive(
+                "walltime", walltime, ssh_hpc_server._VALID_WALLTIME_RE,
+            )
+
+
+class TestDirectDependenciesAreDeclared:
+    def test_mcp_is_declared_not_just_transitive(self):
+        """`from mcp.types import ToolAnnotations` is a direct import."""
+        import pathlib
+        import tomllib
+        root = pathlib.Path(ssh_hpc_server.__file__).parent
+        meta = tomllib.loads((root / "pyproject.toml").read_text())
+        # "fastmcp" contains "mcp": match the distribution name, not a substring.
+        import re as _re
+        names = {_re.split(r"[<>=!~\[ ]", d, maxsplit=1)[0].strip().lower()
+                 for d in meta["project"]["dependencies"]}
+        assert "mcp" in names, names
+
+
+# ---------------------------------------------------------------------------
+# F9: submit_job truncates the remote file it writes
+# ---------------------------------------------------------------------------
+# The auto-generated claude_job_<hex>.sh really is additive, so the annotation
+# stays -- but with an explicit remote_filename `cat >` replaces whatever is
+# there, and the docstring never said so.
+
+class TestSubmitJobSaysItOverwrites:
+    def test_the_docstring_warns_about_an_existing_file(self):
+        doc = ssh_hpc_server.submit_job.__doc__
+        assert "overwrit" in doc.lower() or "replace" in doc.lower(), doc
+
+    def test_the_annotation_is_still_additive(self):
+        """The default filename is unique, so auto-approval stays reasonable."""
+        import inspect
+        source = inspect.getsource(ssh_hpc_server)
+        assert "@mcp.tool(annotations=_ADDITIVE)\ndef submit_job(" in source
