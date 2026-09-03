@@ -681,22 +681,6 @@ def _cached_poll(key: tuple, produce) -> str:
 
 TIER_ORDER = {"free": 0, "route": 1, "confirm": 2, "block": 3}
 
-# Paths whose recursive deletion is never an accident worth allowing.
-_PROTECTED_ROOT_RE = re.compile(
-    r"""^["']?(?:
-        /|/\*
-      | ~/?|~/\*
-      | \$\{?HOME\}?/?\*?
-      | /glade(?:/scratch|/work|/campaign|/u|/derecho)?/?\*?
-      | /scratch(?:/alpine)?/?\*?
-      | /pl(?:/active)?/?\*?
-      | /projects/?\*?
-      | /home/?\*?
-      | /work/?\*?
-    )["']?$""",
-    re.X,
-)
-
 # Whole-command patterns (checked before segmentation).
 _WHOLE_BLOCK_RULES = (
     (re.compile(r":\(\)\s*\{"), "fork bomb"),
@@ -774,8 +758,27 @@ SHARED_ROOTS = frozenset({
     "/scratch", "/scratch/alpine", "/projects", "/pl", "/pl/active",
     "/home", "/work", "/data",
 })
+# rm alone also protects the home directory, which is not shared but is everything.
+_HOME_FORMS = frozenset({"~", "$HOME", "${HOME}"})
+
+
+def _root_of(path: str) -> str | None:
+    """Canonical form of a path argument for the shared-root checks.
+
+    '/x/y' for an absolute path (a trailing '/' or '/*' dropped, so `rm -rf
+    /glade/work/*` is /glade/work), '~' for any spelling of the home directory,
+    None for a relative path. Quotes are ignored: `"$HOME"/` is $HOME.
+    """
+    clean = path.replace('"', "").replace("'", "")
+    if clean.endswith("/*"):
+        clean = clean[:-2] or "/"
+    if clean.startswith("/"):
+        return "/" + clean.strip("/")
+    return "~" if clean.rstrip("/") in _HOME_FORMS else None
+
+
 _TRAVERSAL_RE = re.compile(
-    r"^(?:lfs\s+find|find|du|ncdu|tree|ls|grep|egrep|fgrep|rg|ripgrep|locate)\b(?P<rest>.*)$", re.S,
+    r"^(?:lfs\s+find|find|du|ncdu|tree|ls|grep|egrep|fgrep|rg|ripgrep)\b(?P<rest>.*)$", re.S,
 )
 # For these, the first non-flag token is a pattern, not a path.
 _PATTERN_FIRST = ("grep", "egrep", "fgrep", "rg", "ripgrep")
@@ -832,14 +835,11 @@ def _traversal_tier(segment: str) -> tuple[str, str] | None:
         paths.append(tok)
 
     for path in paths:
-        clean = path.strip("\"'")
-        if not clean.startswith("/"):
-            continue
-        normalised = "/" + clean.strip("/") if clean.strip("/") else "/"
-        if normalised in SHARED_ROOTS:
+        root = _root_of(path)
+        if root in SHARED_ROOTS:
             return (
                 "block",
-                f"recursive traversal at or above the shared root {normalised} "
+                f"recursive traversal at or above the shared root {root} "
                 f"({name}): this causes a filesystem metadata storm for every user. "
                 "Point it at your own subdirectory instead.",
             )
@@ -908,19 +908,20 @@ def _rm_tier(segment: str) -> tuple[str, str] | None:
     if not recursive:
         return None
     for path in paths:
-        if _PROTECTED_ROOT_RE.match(path.replace('"', "").replace("'", "")):
+        root = _root_of(path)
+        if root == "~" or root in SHARED_ROOTS:
             return ("block", f"recursive delete of a protected path ({path})")
     return ("confirm", "recursive delete (rm -r)")
 
 
 def _interpreter_tier(segment: str) -> tuple[str, str] | None:
-    """python/Rscript/... running a script is compute; -c, --version and a bare REPL are not."""
+    """python/Rscript/... running a script is compute; a -c/-e one-liner, --version and a bare REPL are not."""
     m = _INTERPRETER_RE.match(segment)
     if not m:
         return None
     rest = m.group("rest")
     name = segment.split()[0]
-    if _VERSION_FLAG_RE.search(rest) or re.search(r"(?:^|\s)-c(?:\s|$)", rest):
+    if _VERSION_FLAG_RE.search(rest) or re.search(r"(?:^|\s)-[ce](?:\s|$)", rest):
         return None
     if re.search(r"(?:^|\s)-m\s+\S", rest):
         return ("route", f"{name} -m: runs a module")
@@ -1026,8 +1027,9 @@ def _policy_refusal(
             "call again with confirm_destructive=true."
         )
     if tier == "route" and not allow_on_login_node:
+        node = "data-transfer" if role == "dtn" else "login"
         return (
-            f"Refused on a login node: {rule}.\n"
+            f"Refused on a {node} node: {rule}.\n"
             f"NCAR and CU Boulder terminate this kind of work on login nodes and may flag the "
             "account. Use run_on_compute(host, command, account=...) to run it on a compute "
             "node, or submit_job for anything long. If this really is a small, quick case, "

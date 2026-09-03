@@ -285,3 +285,63 @@ class TestBlockTierIsNoWiderThanItsHarm:
     ])
     def test_the_real_thing_still_blocks(self, cmd):
         assert tier(cmd) == "block", cmd
+
+
+# ---------------------------------------------------------------------------
+# Round 1 (v1.10.0) F12, F13: policy engine nuances, and one list of shared roots
+# ---------------------------------------------------------------------------
+
+class TestPolicyNuances:
+    def test_locate_walks_nothing(self):
+        """locate queries a database; it is not a traversal."""
+        assert tier("locate /glade") == "free"
+        assert tier("locate '/glade/work/foo'") == "free"
+
+    @pytest.mark.parametrize("cmd", [
+        "julia -e '1+1'",
+        "perl -e 'print 1'",
+        "Rscript -e 'x<-1'",
+        "ruby -e 'puts 1'",
+    ])
+    def test_a_one_liner_is_not_running_a_script(self, cmd):
+        assert tier(cmd, "login") == "free", cmd
+
+    def test_a_script_is_still_routed(self):
+        assert tier("julia solve.jl", "login") == "route"
+
+    def test_the_route_refusal_names_the_node_it_is_on(self):
+        from ssh_hpc_server import _policy_refusal
+        assert "login node" in _policy_refusal("python3 x.py", "login", False, False)
+        assert "data-transfer node" in _policy_refusal("python3 x.py", "dtn", False, False)
+
+
+class TestOneListOfSharedRoots:
+    """SHARED_ROOTS drove the traversal rule and a separate regex drove rm, and the
+    two disagreed: a traversal of /glade/derecho/scratch was blocked while
+    `rm -rf /glade/derecho/scratch` was merely a confirmation."""
+
+    @pytest.mark.parametrize("cmd", [
+        "rm -rf /glade/derecho/scratch",
+        "rm -rf /glade/derecho/scratch/",
+        "rm -rf /glade/u/home",
+        "rm -rf /data",
+        "rm -rf /glade/campaign/*",
+        "rm -rf /work",
+    ])
+    def test_every_shared_root_is_protected_from_rm(self, cmd):
+        assert tier(cmd) == "block", cmd
+
+    @pytest.mark.parametrize("root", sorted(ssh_hpc_server.SHARED_ROOTS))
+    def test_rm_and_traversal_agree_on_each_root(self, root):
+        assert tier(f"rm -rf {root}") == "block", root
+        assert tier(f"find {root} -name x") == "block", root
+
+    @pytest.mark.parametrize("cmd", ["rm -rf ~", "rm -rf ~/", "rm -rf ~/*", "rm -rf $HOME", "rm -rf ${HOME}/", 'rm -rf "$HOME"'])
+    def test_home_is_still_protected_from_rm(self, cmd):
+        assert tier(cmd) == "block", cmd
+
+    def test_home_is_not_a_shared_root_for_traversal(self):
+        assert tier("find ~ -name '*.nc'") == "free"
+
+    def test_the_second_list_is_gone(self):
+        assert not hasattr(ssh_hpc_server, "_PROTECTED_ROOT_RE")
