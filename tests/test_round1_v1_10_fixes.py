@@ -155,3 +155,71 @@ class TestTimeoutNoteIsAttachedWhereItIsTrue:
             host="derecho", command="python3 heavy.py", account="UABC0001", scheduler="pbs", timeout=3,
         )
         assert "list_queue" in result and "cancel_job" in result, result
+
+
+# ---------------------------------------------------------------------------
+# F5: read_remote_file returns the file, and decides "truncated" from a byte count
+# ---------------------------------------------------------------------------
+# The reply was decoded with errors="replace" and then re-encoded to measure it,
+# so every undecodable byte became a 3-byte U+FFFD: a 300-byte Latin-1 log read in
+# full was reported truncated and cut (live). The truncated branch also skipped
+# the MAX_OUTPUT_CHARS cap, and the success branch went through the command
+# formatter, which appended shell stderr to the file and turned a whitespace-only
+# file into "(no output)". One return path now: the remote reports the byte count
+# on stderr (`wc -c`, a stat), the body is what the remote sent, and the cap applies.
+
+LATIN1_300 = "a" * 200 + "�" * 100   # what _run_raw hands us for 200 x 'a' + 100 x 0xE9
+
+
+class TestReadRemoteFileReturnsTheFile:
+    def _read(self, mock_subprocess, stdout, stderr, **kw):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout=stdout, stderr=stderr)
+        return ssh_hpc_server.read_remote_file(host="derecho", remote_path="/tmp/f", **kw)
+
+    def test_the_remote_is_asked_for_the_byte_count(self, mock_subprocess):
+        self._read(mock_subprocess, "x", "1\n")
+        script = mock_subprocess.call_args.kwargs["input"]
+        assert "wc -c" in script, script
+        assert f"head -c {ssh_hpc_server.DEFAULT_MAX_BYTES} " in script, script
+
+    def test_max_lines_counts_the_selected_lines(self, mock_subprocess):
+        self._read(mock_subprocess, "x", "1\n", max_lines=5)
+        script = mock_subprocess.call_args.kwargs["input"]
+        assert "head -n 5 -- /tmp/f | wc -c" in script, script
+
+    def test_a_latin1_file_read_in_full_is_not_called_truncated(self, mock_subprocess):
+        result = self._read(mock_subprocess, LATIN1_300, "300\n", max_bytes=300)
+        assert "truncated" not in result, result
+        assert len(result) == 300, len(result)
+
+    def test_a_latin1_file_that_is_longer_is_truncated_by_the_real_count(self, mock_subprocess):
+        result = self._read(mock_subprocess, LATIN1_300, "500\n", max_bytes=300)
+        assert "truncated at 300 of 500 bytes" in result, result
+        assert result.startswith(LATIN1_300[:-1])
+
+    def test_the_truncated_branch_honours_the_output_cap(self, mock_subprocess):
+        result = self._read(mock_subprocess, "a" * 300_000, "400000\n", max_bytes=300_000)
+        assert len(result) <= ssh_hpc_server.MAX_OUTPUT_CHARS + 200, len(result)
+        assert "truncated to" in result, result[-200:]
+
+    def test_shell_chatter_on_stderr_is_not_part_of_the_file(self, mock_subprocess):
+        chatter = "Lmod Warning: module 'foo' not found\n12\n"
+        assert self._read(mock_subprocess, "line1\nline2\n", chatter) == "line1\nline2\n"
+
+    def test_a_whitespace_only_file_is_returned_as_is(self, mock_subprocess):
+        assert self._read(mock_subprocess, "  \n\n", "4\n") == "  \n\n"
+
+    def test_an_empty_file_still_says_so(self, mock_subprocess):
+        assert self._read(mock_subprocess, "", "0\n") == "(no output)"
+
+    def test_a_split_codepoint_at_the_cut_is_dropped(self, mock_subprocess):
+        wire = ("é" * 6).encode("utf-8")[:11].decode("utf-8", "replace")
+        result = self._read(mock_subprocess, wire, "12\n", max_bytes=11)
+        assert "�" not in result, result
+        assert result.startswith("é" * 5)
+
+    def test_a_failure_is_still_reported_with_its_stderr(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=1, stdout="", stderr="head: cannot open '/tmp/f' for reading: No such file or directory\n")
+        result = ssh_hpc_server.read_remote_file(host="derecho", remote_path="/tmp/f")
+        assert "[EXIT CODE 1]" in result and "No such file" in result

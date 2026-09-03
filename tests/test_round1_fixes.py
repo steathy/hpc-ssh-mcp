@@ -96,19 +96,22 @@ REPLACEMENT = "�"
 
 
 class TestByteCapIsCountedInBytes:
+    """Since the 1.10.0 review (F5) the remote reports the byte count itself, so
+    these mock what `head -c` and `wc -c` really send: at most the cap on stdout,
+    the file's size on stderr."""
+
+    def _read(self, mock_subprocess, stdout, size, **kw):
+        mock_subprocess.return_value = make_completed_process(
+            returncode=0, stdout=stdout, stderr=f"{size}\n")
+        return ssh_hpc_server.read_remote_file(host="derecho", remote_path="/tmp/log", **kw)
+
     def test_multibyte_file_over_the_cap_is_flagged(self, mock_subprocess):
-        # 6 x 'é' is 6 characters but 12 bytes; the cap is 10.
-        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="é" * 6)
-        result = ssh_hpc_server.read_remote_file(
-            host="derecho", remote_path="/tmp/log", max_bytes=10,
-        )
-        assert "truncated at 10 bytes" in result, result
+        # 6 x 'é' is 12 bytes; the cap is 10, so the remote sends 5 of them and says 12.
+        result = self._read(mock_subprocess, "é" * 5, 12, max_bytes=10)
+        assert "truncated at 10 of 12 bytes" in result, result
 
     def test_what_comes_back_honours_the_byte_cap(self, mock_subprocess):
-        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="é" * 6)
-        result = ssh_hpc_server.read_remote_file(
-            host="derecho", remote_path="/tmp/log", max_bytes=10,
-        )
+        result = self._read(mock_subprocess, "é" * 5, 12, max_bytes=10)
         body = result.split("\n[truncated")[0]
         assert len(body.encode("utf-8")) <= 10, len(body.encode("utf-8"))
 
@@ -116,36 +119,24 @@ class TestByteCapIsCountedInBytes:
         """head -c cuts on a byte boundary; the partial character must not survive."""
         wire = ("é" * 6).encode("utf-8")[:11].decode("utf-8", "replace")
         assert wire.endswith(REPLACEMENT)  # what _run_raw really hands us
-        mock_subprocess.return_value = make_completed_process(returncode=0, stdout=wire)
-        result = ssh_hpc_server.read_remote_file(
-            host="derecho", remote_path="/tmp/log", max_bytes=10,
-        )
+        result = self._read(mock_subprocess, wire, 12, max_bytes=11)
         assert REPLACEMENT not in result, result
 
     def test_the_binary_notice_counts_bytes_too(self, mock_subprocess):
         """Same mislabel: the message said "bytes" and printed a character count."""
         # 3 x 'é' plus a NUL is 4 characters but 7 bytes.
-        mock_subprocess.return_value = make_completed_process(
-            returncode=0, stdout="é" * 3 + "\x00",
-        )
-        result = ssh_hpc_server.read_remote_file(host="derecho", remote_path="/tmp/bin")
+        result = self._read(mock_subprocess, "é" * 3 + "\x00", 7)
         assert "binary" in result.lower()
         assert "first 7 bytes" in result, result
 
     def test_ascii_over_the_cap_is_still_flagged(self, mock_subprocess):
-        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="a" * 11)
-        result = ssh_hpc_server.read_remote_file(
-            host="derecho", remote_path="/tmp/log", max_bytes=10,
-        )
-        assert "truncated at 10 bytes" in result, result
+        result = self._read(mock_subprocess, "a" * 10, 11, max_bytes=10)
+        assert "truncated at 10 of 11 bytes" in result, result
 
     @pytest.mark.parametrize("content", ["a" * 10, "é" * 5])
     def test_a_file_that_exactly_fills_the_cap_is_not_flagged(self, mock_subprocess, content):
         assert len(content.encode("utf-8")) == 10
-        mock_subprocess.return_value = make_completed_process(returncode=0, stdout=content)
-        result = ssh_hpc_server.read_remote_file(
-            host="derecho", remote_path="/tmp/log", max_bytes=10,
-        )
+        result = self._read(mock_subprocess, content, 10, max_bytes=10)
         assert "truncated" not in result, result
         assert result == content
 

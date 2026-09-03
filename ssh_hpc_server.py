@@ -219,6 +219,13 @@ def _truncate(text: str, limit: int, hint: str = "") -> str:
     return text[:limit] + f"\n[output truncated to {limit} characters{hint}]"
 
 
+def _trailing_int(text: str) -> int | None:
+    """The last non-empty line of text as an integer, or None."""
+    lines = (text or "").strip().splitlines()
+    last = lines[-1].strip() if lines else ""
+    return int(last) if last.isdigit() else None
+
+
 def _format_result(returncode: int, stdout: str, stderr: str) -> str:
     """Format a subprocess result into a human-readable string.
 
@@ -1379,7 +1386,12 @@ def read_remote_file(
     if max_bytes < 1:
         raise ValueError(f"max_bytes must be >= 1, got {max_bytes}")
     path = _shell_path(remote_path)
-    probe = int(max_bytes) + 1  # one extra byte tells us the file was longer
+    cap = int(max_bytes)
+    # The remote reports the byte count on stderr (`wc -c` on a regular file is a
+    # stat, not a read), because the count cannot be recovered here: _run_raw
+    # decodes with errors="replace", and every undecodable byte in a Latin-1 log
+    # becomes a 3-byte U+FFFD, so re-encoding the text overstated the length and
+    # called a file read in full "truncated" -- then cut it.
     if max_lines > 0:
         # A pipeline reports the status of its last command, and `head -c`
         # succeeds on empty input, so a failed `head -n` used to look like an
@@ -1388,12 +1400,14 @@ def read_remote_file(
         # which turns a correctly truncated read into exit 141. So open the file
         # once on its own first -- that is what reports a missing path, a
         # directory or a permission problem -- and let the pipeline follow.
+        lines = int(max_lines)
         script = (
             f"head -c 1 -- {path} >/dev/null || exit\n"
-            f"head -n {int(max_lines)} -- {path} | head -c {probe}"
+            f"head -n {lines} -- {path} | head -c {cap}\n"
+            f"head -n {lines} -- {path} | wc -c >&2"
         )
     else:
-        script = f"head -c {probe} -- {path}"
+        script = f"head -c {cap} -- {path} && wc -c < {path} >&2"
 
     rc, out, err = _run_ssh_script_raw(host, script)
     if rc != 0:
@@ -1405,17 +1419,21 @@ def read_remote_file(
             f"{len(out.encode('utf-8', 'replace'))} bytes). "
             "Use scp_download_file to fetch it instead of reading it into context."
         )
-    # max_bytes is a byte count, and so is `head -c`: comparing it against
-    # len(out), a character count, never fired for a non-ASCII file. Slicing
-    # the encoded form also drops the partial character head -c cut in half,
-    # which _run_raw had decoded to U+FFFD.
-    data = out.encode("utf-8", "replace")
-    if len(data) > max_bytes:
-        return data[:max_bytes].decode("utf-8", "ignore") + (
-            f"\n[truncated at {max_bytes} bytes; the file is longer. Use max_lines, "
-            "a larger max_bytes, tail_remote_file for the end, or scp_download_file for all of it]"
+    if not out:
+        return "(no output)"
+    # The body is the file as the remote sent it. stderr is the byte count and
+    # whatever the login shell said on the way in; neither is file content.
+    size = _trailing_int(err)
+    if size is None:  # the count did not arrive; fall back to measuring the text
+        size = len(out.encode("utf-8", "replace"))
+    if size > cap:
+        # head -c cuts on a byte boundary; a codepoint split there decoded to one U+FFFD.
+        body = out[:-1] if out.endswith("�") else out
+        out = body + (
+            f"\n[truncated at {cap} of {size} bytes. Use max_lines, a larger max_bytes, "
+            "tail_remote_file for the end, or scp_download_file for all of it]"
         )
-    return _format_result(rc, out, err)
+    return _truncate(out, MAX_OUTPUT_CHARS)
 
 
 @mcp.tool(annotations=_READ_ONLY)

@@ -262,7 +262,10 @@ class TestRemotePathOptionSafety:
     def test_read_terminates_options_before_path(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="")
         read_remote_file(host="derecho", remote_path="-n")
-        assert mock_subprocess.call_args.kwargs.get("input", "").rstrip().endswith(" -- -n")
+        script = mock_subprocess.call_args.kwargs.get("input", "")
+        assert f"head -c {ssh_hpc_server.DEFAULT_MAX_BYTES} -- -n" in script, script
+        # The byte count reads the path through a redirection, which can never be an option.
+        assert "wc -c < -n" in script, script
 
     def test_read_with_max_lines_terminates_options(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="")
@@ -301,11 +304,12 @@ class TestTildeRemotePaths:
 # ---------------------------------------------------------------------------
 
 class TestReadRemoteFileCaps:
-    def test_default_requests_one_byte_past_the_cap(self, mock_subprocess):
-        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="x")
+    def test_default_requests_the_cap_and_the_files_size(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="x", stderr="1\n")
         read_remote_file(host="derecho", remote_path="/tmp/big.log")
         script = mock_subprocess.call_args.kwargs.get("input", "")
-        assert f"head -c {ssh_hpc_server.DEFAULT_MAX_BYTES + 1}" in script
+        assert f"head -c {ssh_hpc_server.DEFAULT_MAX_BYTES} " in script
+        assert "wc -c" in script
 
     def test_max_lines_is_also_byte_capped(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="x")
@@ -315,7 +319,9 @@ class TestReadRemoteFileCaps:
 
     def test_oversize_output_is_cut_with_a_notice(self, mock_subprocess):
         cap = 100
-        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="a" * (cap + 1))
+        # What the remote really sends: exactly `cap` bytes, and the file's size on stderr.
+        mock_subprocess.return_value = make_completed_process(
+            returncode=0, stdout="a" * cap, stderr=f"{cap + 1}\n")
         result = read_remote_file(host="derecho", remote_path="/tmp/big.log", max_bytes=cap)
         assert result.startswith("a" * cap)
         assert "a" * (cap + 1) not in result

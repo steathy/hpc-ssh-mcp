@@ -124,7 +124,7 @@ class TestLiveFiles:
         _ok(execute_remote_bash(HOST, f"""for i in $(seq 200); do printf '\\303\\251'; done > '{path}'"""))
         assert _ok(execute_remote_bash(HOST, f"wc -c < '{path}'")).strip() == "400"
         out = read_remote_file(HOST, path, max_bytes=300)
-        assert "truncated at 300 bytes" in out, out
+        assert "truncated at 300 of 400 bytes" in out, out
         body = out.split("\n[truncated")[0]
         assert len(body.encode("utf-8")) <= 300, len(body.encode("utf-8"))
         assert "\ufffd" not in body, "head -c split a codepoint and it was returned mangled"
@@ -146,12 +146,35 @@ class TestLiveFiles:
         out = read_remote_file(HOST, path, max_lines=1500, max_bytes=200)
         assert "[EXIT CODE" not in out, out
         assert out.startswith("x" * 100), out
-        assert "truncated at 200 bytes" in out, out
+        assert "truncated at 200 of 151500 bytes" in out, out
 
     def test_an_empty_file_with_max_lines_is_still_empty(self, remote_dir):
         path = f"{remote_dir}/empty.log"
         _ok(execute_remote_bash(HOST, f": > '{path}'"))
         assert read_remote_file(HOST, path, max_lines=5) == "(no output)"
+
+    def test_a_latin1_file_read_in_full_is_not_called_truncated(self, remote_dir):
+        """Round 1 (1.10.0) F5: truncation was decided by re-encoding the
+        replacement-decoded text, so every undecodable byte counted three times
+        and a 300-byte Latin-1 log read whole came back cut and flagged."""
+        path = f"{remote_dir}/latin1.log"
+        _ok(execute_remote_bash(
+            HOST, f"{{ head -c 200 /dev/zero | tr '\\0' a; for i in $(seq 100); do printf '\\351'; done; }} > '{path}'"))
+        assert _ok(execute_remote_bash(HOST, f"wc -c < '{path}'")).strip() == "300"
+        out = read_remote_file(HOST, path, max_bytes=300)
+        assert "truncated" not in out, out
+        assert len(out) == 300 and out.startswith("a" * 200), len(out)
+
+    def test_an_over_cap_read_stays_within_the_output_cap(self, remote_dir):
+        path = f"{remote_dir}/huge.txt"
+        _ok(execute_remote_bash(HOST, f"head -c 400000 /dev/zero | tr '\\0' a > '{path}'"))
+        out = read_remote_file(HOST, path, max_bytes=300_000)
+        assert len(out) <= ssh_hpc_server.MAX_OUTPUT_CHARS + 200, len(out)
+
+    def test_a_whitespace_only_file_is_its_whitespace(self, remote_dir):
+        path = f"{remote_dir}/ws.txt"
+        _ok(execute_remote_bash(HOST, f"printf '  \\n\\n' > '{path}'"))
+        assert read_remote_file(HOST, path) == "  \n\n"
 
     def test_binary_file_is_refused(self, remote_dir):
         path = f"{remote_dir}/bin.dat"
