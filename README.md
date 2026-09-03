@@ -352,7 +352,7 @@ You do not have to write these by hand. The first time a tool touches a host wit
 
 1. `probe_host` connects and reports what it finds: the scheduler, which of the known HPC filesystems are mounted, any project code in the environment, and whether the Globus CLI is installed. It proposes an annotation and lists what it cannot detect.
 2. The agent asks you the rest. Whether this really is a shared HPC system, which project code jobs should charge, and which policy level you want. It is told not to choose the policy for you.
-3. `annotate_host` records your answers.
+3. `annotate_host` records your answers. Calling it again updates the keys you pass and leaves the rest alone, so relaxing one host's policy later does not erase its project code. To remove a setting, edit or delete the file.
 
 **It does not write to `~/.ssh/config`, and nothing here ever will.** That file controls access to every host you have. A mangled line, a replaced symlink from a dotfile manager, or a downgraded file mode would cost you far more than the convenience is worth, so the server reads it and leaves it alone.
 

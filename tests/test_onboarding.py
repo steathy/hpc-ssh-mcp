@@ -284,10 +284,12 @@ class TestAnnotateHostStore:
         annotate_host("newbox", center="ncar")
         assert "delete" in store.read_text().lower()
 
-    def test_replaces_an_earlier_entry_for_the_same_host(self, ssh_config, store):
+    def test_re_annotating_updates_without_dropping_the_rest(self, ssh_config, store):
         annotate_host("newbox", center="ncar", account="OLD001")
-        annotate_host("newbox", center="ncar", account="NEW002")
-        assert _host_directives("newbox")["account"] == "NEW002"
+        annotate_host("newbox", account="NEW002")
+        directives = _host_directives("newbox")
+        assert directives["account"] == "NEW002"
+        assert directives["center"] == "ncar"
         assert "OLD001" not in store.read_text()
 
     def test_other_entries_survive(self, ssh_config, store):

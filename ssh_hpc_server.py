@@ -205,9 +205,20 @@ def _truncate(text: str, limit: int, hint: str = "") -> str:
 
 
 def _format_result(returncode: int, stdout: str, stderr: str) -> str:
-    """Format a subprocess result into a human-readable string."""
+    """Format a subprocess result into a human-readable string.
+
+    stderr is reported even when the command succeeded. An HPC toolchain says a
+    great deal on stderr while still exiting 0 -- module load warnings, compiler
+    diagnostics, srun allocation notes, conda solver messages -- and dropping
+    all of it left the caller unable to react to what it never saw.
+    """
     if returncode == 0:
-        return _truncate(stdout, MAX_OUTPUT_CHARS) if stdout.strip() else "(no output)"
+        parts = []
+        if stdout.strip():
+            parts.append(_truncate(stdout, MAX_OUTPUT_CHARS))
+        if stderr.strip():
+            parts.append(f"stderr:\n{_truncate(stderr.rstrip(), MAX_OUTPUT_CHARS)}")
+        return "\n".join(parts) if parts else "(no output)"
     parts = [f"[EXIT CODE {returncode}]"]
     if stdout.strip():
         parts.append(f"stdout:\n{_truncate(stdout.rstrip(), MAX_OUTPUT_CHARS)}")
@@ -271,6 +282,24 @@ def _diagnose_ssh_failure(host: str, stderr: str) -> str:
     return ""
 
 
+def _run_ssh_checked(
+    host: str,
+    remote_cmd: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    input_data: str | None = None,
+) -> tuple[bool, str]:
+    """Like _run_ssh, but also says whether the command succeeded.
+
+    Callers that must not remember a failure (see _cached_poll) need the status
+    as well as the text.
+    """
+    rc, out, err = _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
+    formatted = _format_result(rc, out, err)
+    if rc == SSH_OWN_FAILURE_RC:
+        formatted += _diagnose_ssh_failure(host, err)
+    return rc == 0, formatted + _onboarding_notice(host)
+
+
 def _run_ssh(
     host: str,
     remote_cmd: str,
@@ -278,11 +307,7 @@ def _run_ssh(
     input_data: str | None = None,
 ) -> str:
     """Run a remote command over ssh and append a diagnostic hint on failure."""
-    rc, out, err = _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
-    formatted = _format_result(rc, out, err)
-    if rc == SSH_OWN_FAILURE_RC:
-        formatted += _diagnose_ssh_failure(host, err)
-    return formatted + _onboarding_notice(host)
+    return _run_ssh_checked(host, remote_cmd, timeout=timeout, input_data=input_data)[1]
 
 
 def _run_ssh_raw(
@@ -310,6 +335,11 @@ def _run_ssh_script(host: str, script: str, timeout: int = DEFAULT_TIMEOUT) -> s
 def _run_ssh_script_raw(host: str, script: str, timeout: int = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
     """Run a bash script on the remote host via stdin; raw (rc, stdout, stderr)."""
     return _run_ssh_raw(host, BASH_STDIN, timeout=timeout, input_data=script)
+
+
+def _run_ssh_script_checked(host: str, script: str, timeout: int = DEFAULT_TIMEOUT) -> tuple[bool, str]:
+    """Run a bash script on the remote host via stdin; (succeeded, formatted output)."""
+    return _run_ssh_checked(host, BASH_STDIN, timeout=timeout, input_data=script)
 
 
 def _large_transfer_notice(path: str) -> str:
@@ -639,7 +669,13 @@ _POLL_CACHE: dict[tuple, tuple[float, str]] = {}
 
 
 def _cached_poll(key: tuple, produce) -> str:
-    """Return a recent identical scheduler answer, or produce and store a new one."""
+    """Return a recent identical scheduler answer, or produce and store a new one.
+
+    `produce` returns (succeeded, text), and only a success is remembered.
+    Caching a failure meant that after the user re-established the ControlMaster
+    the next 30 s of retries replayed the stale error -- relabelled as rate
+    limiting -- so the obvious reading was that the fix had not worked.
+    """
     now = time.monotonic()
     hit = _POLL_CACHE.get(key)
     if hit and now - hit[0] < SCHEDULER_POLL_INTERVAL:
@@ -648,8 +684,9 @@ def _cached_poll(key: tuple, produce) -> str:
             f"{hit[1]}\n[cached {age}s ago; scheduler queries are rate-limited to one per "
             f"{SCHEDULER_POLL_INTERVAL}s per host. Wait before polling again.]"
         )
-    result = produce()
-    _POLL_CACHE[key] = (now, result)
+    succeeded, result = produce()
+    if succeeded:
+        _POLL_CACHE[key] = (now, result)
     return result
 
 
@@ -1211,7 +1248,7 @@ def check_job(host: str, job_id: str, scheduler: str = "auto") -> str:
             "echo '=== sacct (accounting) ==='\n"
             f"sacct -j {sid} --format=JobID,JobName,Partition,State,ExitCode,Elapsed,Start,End --parsable2\n"
         )
-    return _cached_poll(("job", host, script), lambda: _run_ssh_script(host, script))
+    return _cached_poll(("job", host, script), lambda: _run_ssh_script_checked(host, script))
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -1238,7 +1275,7 @@ def list_queue(host: str, user: str = "", scheduler: str = "auto") -> str:
         script = f"qstat -w -u {who}"
     else:
         script = f"squeue -u {who} --format='{_SQUEUE_FORMAT}'"
-    return _cached_poll(("queue", host, script), lambda: _run_ssh_script(host, script))
+    return _cached_poll(("queue", host, script), lambda: _run_ssh_script_checked(host, script))
 
 
 @mcp.tool(annotations=_OVERWRITES)
@@ -1360,7 +1397,17 @@ def read_remote_file(
     path = _shell_path(remote_path)
     probe = int(max_bytes) + 1  # one extra byte tells us the file was longer
     if max_lines > 0:
-        script = f"head -n {int(max_lines)} -- {path} | head -c {probe}"
+        # A pipeline reports the status of its last command, and `head -c`
+        # succeeds on empty input, so a failed `head -n` used to look like an
+        # empty file. pipefail is not the answer either: `head -c` closes the
+        # pipe the moment it has its bytes and `head -n` then dies of SIGPIPE,
+        # which turns a correctly truncated read into exit 141. So open the file
+        # once on its own first -- that is what reports a missing path, a
+        # directory or a permission problem -- and let the pipeline follow.
+        script = (
+            f"head -c 1 -- {path} >/dev/null || exit\n"
+            f"head -n {int(max_lines)} -- {path} | head -c {probe}"
+        )
     else:
         script = f"head -c {probe} -- {path}"
 
@@ -1370,11 +1417,17 @@ def read_remote_file(
         return result + (_diagnose_ssh_failure(host, err) if rc == SSH_OWN_FAILURE_RC else "")
     if "\x00" in out:
         return (
-            f"{remote_path} looks like a binary file (NUL bytes in the first {len(out)} bytes). "
+            f"{remote_path} looks like a binary file (NUL bytes in the first "
+            f"{len(out.encode('utf-8', 'replace'))} bytes). "
             "Use scp_download_file to fetch it instead of reading it into context."
         )
-    if len(out) > max_bytes:
-        return out[:max_bytes] + (
+    # max_bytes is a byte count, and so is `head -c`: comparing it against
+    # len(out), a character count, never fired for a non-ASCII file. Slicing
+    # the encoded form also drops the partial character head -c cut in half,
+    # which _run_raw had decoded to U+FFFD.
+    data = out.encode("utf-8", "replace")
+    if len(data) > max_bytes:
+        return data[:max_bytes].decode("utf-8", "ignore") + (
             f"\n[truncated at {max_bytes} bytes; the file is longer. Use max_lines, "
             "a larger max_bytes, tail_remote_file for the end, or scp_download_file for all of it]"
         )
@@ -1982,7 +2035,7 @@ def probe_host(host: str) -> str:
         lines.append(
             f"{host!r} is already annotated with: "
             + " ".join(f"{k}={v}" for k, v in sorted(existing.items()))
-            + ". Re-annotating will replace that.\n"
+            + ". Re-annotating updates the keys you pass and leaves the rest.\n"
         )
     lines += [
         "Detected:",
@@ -2116,8 +2169,6 @@ def annotate_host(
             "account, scratch, globus or policy."
         )
 
-    annotation = _format_annotation(pairs)
-
     known_by_ssh = _ssh_config_knows(host)
     overridden = sorted(set(pairs) & set(_ssh_config_annotations(host)))
 
@@ -2128,8 +2179,17 @@ def annotate_host(
             "Refusing to rewrite it, because that would discard whatever it holds. "
             "Ask the user to fix or delete the file, then try again."
         )
+    # Merge, rather than replace the host's entry. Replacing was the behaviour
+    # in every storage format this server has had, but `is_hpc: bool` cannot
+    # express "leave this alone", so a partial update -- the natural call once a
+    # host is already described -- asserted "this is an HPC system" and dropped
+    # a recorded `hpc=false` along with everything else it did not mention.
+    # Unsetting a key stays a hand-edit of the file, which _STORE_NOTE invites.
     entries = dict(entries)
-    entries[host] = pairs
+    merged = dict(entries.get(host, {}))
+    merged.update(pairs)
+    entries[host] = merged
+    annotation = _format_annotation(merged)
     error = _write_store(entries)
     if error:
         return error

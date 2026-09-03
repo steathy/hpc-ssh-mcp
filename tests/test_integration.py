@@ -74,6 +74,13 @@ class TestLiveShell:
         out = _ok(execute_remote_bash(HOST, "cat; echo EOF-seen", timeout=20))
         assert "EOF-seen" in out
 
+    def test_stderr_survives_a_successful_command(self):
+        """Round 1 F3: everything an HPC toolchain says on stderr while still
+        exiting 0 -- module warnings, compiler diagnostics -- was dropped."""
+        out = execute_remote_bash(HOST, "echo 'WARNING: module not found' >&2; echo real-output")
+        assert "real-output" in out
+        assert "WARNING: module not found" in out, out
+
     def test_remote_failure_text_gets_no_reauth_hint(self):
         out = execute_remote_bash(HOST, "echo 'Permission denied (publickey).' >&2; exit 3")
         assert "[EXIT CODE 3]" in out
@@ -95,6 +102,43 @@ class TestLiveFiles:
         assert out.startswith("a" * 100)
         assert "a" * 101 not in out
         assert "truncated" in out
+
+    def test_a_multibyte_file_is_reported_as_truncated(self, remote_dir):
+        """Round 1 F1: the cap is bytes, and `len(out)` counted characters, so
+        a non-ASCII file came back at half size with no notice at all."""
+        path = f"{remote_dir}/utf8.txt"
+        # 200 x U+00E9 == 200 characters, 400 bytes.
+        _ok(execute_remote_bash(HOST, f"""for i in $(seq 200); do printf '\\303\\251'; done > '{path}'"""))
+        assert _ok(execute_remote_bash(HOST, f"wc -c < '{path}'")).strip() == "400"
+        out = read_remote_file(HOST, path, max_bytes=300)
+        assert "truncated at 300 bytes" in out, out
+        body = out.split("\n[truncated")[0]
+        assert len(body.encode("utf-8")) <= 300, len(body.encode("utf-8"))
+        assert "\ufffd" not in body, "head -c split a codepoint and it was returned mangled"
+
+    def test_a_missing_file_with_max_lines_is_an_error_not_empty_output(self, remote_dir):
+        """Round 1 F2: `head -n | head -c` reported the pipeline's last status,
+        so a missing file was indistinguishable from an empty one."""
+        out = read_remote_file(HOST, f"{remote_dir}/no-such-file.log", max_lines=5)
+        assert out != "(no output)", out
+        assert "No such file" in out or "cannot open" in out, out
+
+    def test_max_lines_on_a_long_file_returns_content_not_a_signal(self, remote_dir):
+        """Round 1 F2, second cut: `pipefail` turned `head -c`'s SIGPIPE kill of
+        `head -n` into [EXIT CODE 141] on a perfectly good truncated read."""
+        path = f"{remote_dir}/long.log"
+        _ok(execute_remote_bash(
+            HOST, f"""awk 'BEGIN{{for(i=0;i<2000;i++){{s="";for(j=0;j<100;j++)s=s "x"; print s}}}}' > '{path}'""",
+        ))
+        out = read_remote_file(HOST, path, max_lines=1500, max_bytes=200)
+        assert "[EXIT CODE" not in out, out
+        assert out.startswith("x" * 100), out
+        assert "truncated at 200 bytes" in out, out
+
+    def test_an_empty_file_with_max_lines_is_still_empty(self, remote_dir):
+        path = f"{remote_dir}/empty.log"
+        _ok(execute_remote_bash(HOST, f": > '{path}'"))
+        assert read_remote_file(HOST, path, max_lines=5) == "(no output)"
 
     def test_binary_file_is_refused(self, remote_dir):
         path = f"{remote_dir}/bin.dat"

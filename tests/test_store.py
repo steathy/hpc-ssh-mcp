@@ -92,10 +92,12 @@ class TestRoundTrip:
         assert hosts["derecho"]["center"] == "ncar"
         assert hosts["cu-alpine"]["center"] == "curc"
 
-    def test_rewriting_a_host_replaces_its_entry(self, store):
+    def test_rewriting_a_host_updates_the_keys_it_is_given(self, store):
         annotate_host("derecho", center="ncar", account="OLD001")
-        annotate_host("derecho", center="ncar", account="NEW002")
-        assert payload(store)["hosts"]["derecho"]["account"] == "NEW002"
+        annotate_host("derecho", account="NEW002")
+        entry = payload(store)["hosts"]["derecho"]
+        assert entry["account"] == "NEW002"
+        assert entry["center"] == "ncar"  # not passed this time, so not dropped
 
     def test_globus_uuid_from_the_store_resolves_as_an_alias(self, store):
         """A UUID written by annotate_host must be usable, not write-only."""
