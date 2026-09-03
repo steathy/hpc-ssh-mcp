@@ -250,3 +250,95 @@ class TestScpTimeoutCleanup:
         result = scp_download_file(host="derecho", remote_path="/r/keep.nc", local_path=str(target), timeout=5)
         assert "Timed out" in result
         assert target.exists()
+
+
+# ---------------------------------------------------------------------------
+# Finding 8: a remote_path beginning with '-' must not become an option
+# ---------------------------------------------------------------------------
+
+class TestRemotePathOptionSafety:
+    def test_read_terminates_options_before_path(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="")
+        read_remote_file(host="derecho", remote_path="-n")
+        assert mock_subprocess.call_args.kwargs.get("input", "").rstrip().endswith(" -- -n")
+
+    def test_read_with_max_lines_terminates_options(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="")
+        read_remote_file(host="derecho", remote_path="--files0-from=/dev/stdin", max_lines=5)
+        script = mock_subprocess.call_args.kwargs.get("input", "")
+        assert "head -n 5 -- --files0-from=/dev/stdin" in script
+
+    def test_tail_terminates_options_before_path(self, mock_subprocess):
+        from ssh_hpc_server import tail_remote_file
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="")
+        tail_remote_file(host="derecho", remote_path="-f")
+        assert "tail -n 50 -- -f" in mock_subprocess.call_args.kwargs.get("input", "")
+
+
+# ---------------------------------------------------------------------------
+# Finding 14 (hygiene): '~' paths must reach the remote shell as $HOME
+# ---------------------------------------------------------------------------
+
+class TestTildeRemotePaths:
+    def test_read_expands_tilde_outside_quotes(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="")
+        read_remote_file(host="derecho", remote_path="~/run1/job.out")
+        script = mock_subprocess.call_args.kwargs.get("input", "")
+        assert '"$HOME"/run1/job.out' in script
+        assert "'~" not in script
+
+    def test_tail_quotes_only_the_rest_of_the_path(self, mock_subprocess):
+        from ssh_hpc_server import tail_remote_file
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="")
+        tail_remote_file(host="derecho", remote_path="~/x y.log")
+        assert "\"$HOME\"/'x y.log'" in mock_subprocess.call_args.kwargs.get("input", "")
+
+
+# ---------------------------------------------------------------------------
+# Finding 11: read_remote_file must not pour an unbounded file into context
+# ---------------------------------------------------------------------------
+
+class TestReadRemoteFileCaps:
+    def test_default_requests_one_byte_past_the_cap(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="x")
+        read_remote_file(host="derecho", remote_path="/tmp/big.log")
+        script = mock_subprocess.call_args.kwargs.get("input", "")
+        assert f"head -c {ssh_hpc_server.DEFAULT_MAX_BYTES + 1}" in script
+
+    def test_max_lines_is_also_byte_capped(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="x")
+        read_remote_file(host="derecho", remote_path="/tmp/big.log", max_lines=5)
+        script = mock_subprocess.call_args.kwargs.get("input", "")
+        assert "head -n 5 -- /tmp/big.log | head -c" in script
+
+    def test_oversize_output_is_cut_with_a_notice(self, mock_subprocess):
+        cap = 100
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="a" * (cap + 1))
+        result = read_remote_file(host="derecho", remote_path="/tmp/big.log", max_bytes=cap)
+        assert result.startswith("a" * cap)
+        assert "a" * (cap + 1) not in result
+        assert "truncated" in result.lower()
+        assert "tail_remote_file" in result
+
+    def test_within_cap_is_returned_verbatim(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="line1\nline2\n")
+        assert read_remote_file(host="derecho", remote_path="/tmp/small") == "line1\nline2\n"
+
+    def test_binary_content_is_refused(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="CDF\x01\x00\x00\x00")
+        result = read_remote_file(host="derecho", remote_path="/glade/x.nc")
+        assert "binary" in result.lower()
+        assert "scp_download_file" in result
+
+    def test_rejects_non_positive_max_bytes(self):
+        with pytest.raises(ValueError, match="max_bytes"):
+            read_remote_file(host="derecho", remote_path="/tmp/x", max_bytes=0)
+
+
+class TestGlobalOutputCap:
+    def test_execute_remote_bash_output_is_capped(self, mock_subprocess):
+        huge = "b" * (ssh_hpc_server.MAX_OUTPUT_CHARS + 50_000)
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout=huge)
+        result = execute_remote_bash(host="derecho", command="cat big")
+        assert len(result) < ssh_hpc_server.MAX_OUTPUT_CHARS + 500
+        assert "truncated" in result.lower()

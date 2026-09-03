@@ -154,7 +154,9 @@ class TestCheckSlurmJob:
 
 
 class TestReadRemoteFile:
-    def test_reads_file_via_cat(self, mock_subprocess):
+    """The read script is delivered on stdin to `bash -s`; inspect the input kwarg."""
+
+    def test_reads_file_via_byte_capped_head(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(
             returncode=0, stdout="line1\nline2\n",
         )
@@ -162,21 +164,24 @@ class TestReadRemoteFile:
         assert "line1" in result
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "ssh"
-        assert "cat" in cmd[-1]
+        assert cmd[-1] == "bash -s"
+        script = mock_subprocess.call_args.kwargs["input"]
+        assert "head -c" in script
+        assert "/home/user/data.csv" in script
 
     def test_uses_head_when_max_lines_set(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(
             returncode=0, stdout="line1\n",
         )
         read_remote_file(host="derecho", remote_path="/tmp/big.log", max_lines=100)
-        cmd = mock_subprocess.call_args[0][0][-1]
-        assert "head -n 100" in cmd
+        script = mock_subprocess.call_args.kwargs["input"]
+        assert "head -n 100" in script
 
     def test_quotes_remote_path(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
         read_remote_file(host="derecho", remote_path="/path with spaces/file.txt")
-        cmd = mock_subprocess.call_args[0][0][-1]
-        assert "'" in cmd
+        script = mock_subprocess.call_args.kwargs["input"]
+        assert "'/path with spaces/file.txt'" in script
 
 
 class TestScpDownloadFile:

@@ -96,6 +96,8 @@ class TestListSlurmQueue:
 
 
 class TestTailRemoteFile:
+    """The tail script is delivered on stdin to `bash -s`; inspect the input kwarg."""
+
     def test_tails_with_default_lines(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(
             returncode=0, stdout="last line\n",
@@ -103,22 +105,21 @@ class TestTailRemoteFile:
         from ssh_hpc_server import tail_remote_file
         result = tail_remote_file(host="derecho", remote_path="/tmp/job.out")
         assert "last line" in result
-        cmd = mock_subprocess.call_args[0][0][-1]
-        assert "tail -n 50" in cmd
+        assert mock_subprocess.call_args[0][0][-1] == "bash -s"
+        assert "tail -n 50" in mock_subprocess.call_args.kwargs["input"]
 
     def test_tails_with_custom_lines(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
         from ssh_hpc_server import tail_remote_file
         tail_remote_file(host="derecho", remote_path="/tmp/x", lines=200)
-        cmd = mock_subprocess.call_args[0][0][-1]
-        assert "tail -n 200" in cmd
+        assert "tail -n 200" in mock_subprocess.call_args.kwargs["input"]
 
     def test_quotes_remote_path(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
         from ssh_hpc_server import tail_remote_file
         tail_remote_file(host="derecho", remote_path="/path with spaces/out.log")
-        cmd = mock_subprocess.call_args[0][0][-1]
-        assert "'" in cmd  # shlex.quote wraps in single quotes
+        script = mock_subprocess.call_args.kwargs["input"]
+        assert "'/path with spaces/out.log'" in script  # shlex.quote wraps in single quotes
 
     def test_rejects_invalid_host(self):
         from ssh_hpc_server import tail_remote_file

@@ -23,6 +23,12 @@ DEFAULT_TIMEOUT = 120
 # Bulk transfers are slow by nature; a 120 s cap silently truncated large files.
 DEFAULT_SCP_TIMEOUT = 3600
 
+# Context protection. read_remote_file asks the remote for at most this many
+# bytes (plus one, to detect truncation); every tool's returned text is capped
+# at MAX_OUTPUT_CHARS so a runaway command cannot flood the model's context.
+DEFAULT_MAX_BYTES = 200_000
+MAX_OUTPUT_CHARS = 200_000
+
 # ssh reserves exit status 255 for its own failures (connection, auth, control
 # socket). Any other status belongs to the remote command, whose stderr must not
 # be mistaken for a session problem.
@@ -168,15 +174,22 @@ def _run_raw(
         return -1, "", f"Command not found: {cmd[0]}. Is it installed and on PATH?"
 
 
+def _truncate(text: str, limit: int, hint: str = "") -> str:
+    """Cut text at limit characters and say so."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n[output truncated to {limit} characters{hint}]"
+
+
 def _format_result(returncode: int, stdout: str, stderr: str) -> str:
     """Format a subprocess result into a human-readable string."""
     if returncode == 0:
-        return stdout if stdout.strip() else "(no output)"
+        return _truncate(stdout, MAX_OUTPUT_CHARS) if stdout.strip() else "(no output)"
     parts = [f"[EXIT CODE {returncode}]"]
     if stdout.strip():
-        parts.append(f"stdout:\n{stdout.rstrip()}")
+        parts.append(f"stdout:\n{_truncate(stdout.rstrip(), MAX_OUTPUT_CHARS)}")
     if stderr.strip():
-        parts.append(f"stderr:\n{stderr.rstrip()}")
+        parts.append(f"stderr:\n{_truncate(stderr.rstrip(), MAX_OUTPUT_CHARS)}")
     return "\n".join(parts)
 
 
@@ -257,6 +270,23 @@ def _run_ssh_raw(
 ) -> tuple[int, str, str]:
     """Like _run_ssh, but returns the raw (rc, stdout, stderr) for callers that branch on rc."""
     return _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
+
+
+# A remote script is delivered on stdin to `bash -s` rather than interpolated
+# into the ssh command line. The user's login shell (bash, zsh, tcsh, ...) only
+# ever sees the two words "bash -s", so no quoting rules of that shell apply,
+# multi-line scripts work, and '!' or '2>/dev/null' cannot be misparsed.
+BASH_STDIN = "bash -s"
+
+
+def _run_ssh_script(host: str, script: str, timeout: int = DEFAULT_TIMEOUT) -> str:
+    """Run a bash script on the remote host via stdin; formatted output."""
+    return _run_ssh(host, BASH_STDIN, timeout=timeout, input_data=script)
+
+
+def _run_ssh_script_raw(host: str, script: str, timeout: int = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
+    """Run a bash script on the remote host via stdin; raw (rc, stdout, stderr)."""
+    return _run_ssh_raw(host, BASH_STDIN, timeout=timeout, input_data=script)
 
 
 def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT) -> tuple[int, str]:
@@ -413,26 +443,47 @@ def read_remote_file(
     host: str,
     remote_path: str,
     max_lines: int = 0,
+    max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> str:
     """Read a text file on a remote host and return its contents.
 
-    Suitable for source code, CSVs, config files, and Slurm .out logs.
-    For large binary files, use scp_download_file instead.
+    Suitable for source code, CSVs, config files, and scheduler .out logs.
+    Output is capped at max_bytes (default 200 KB) and binary files are
+    refused; use scp_download_file for those, tail_remote_file for the end
+    of a long log.
 
     Args:
         host: SSH config alias or hostname.
-        remote_path: Absolute or relative path to the file on the remote host.
-        max_lines: If > 0, only return the first N lines (prevents context explosion on huge files).
+        remote_path: Path on the remote host. Absolute paths are safest; '~/x' is
+            expanded to the remote home directory.
+        max_lines: If > 0, only return the first N lines.
+        max_bytes: Never return more than this many bytes (default 200000).
     """
     _validate_host(host)
-    safe_path = shlex.quote(remote_path)
-
+    if max_bytes < 1:
+        raise ValueError(f"max_bytes must be >= 1, got {max_bytes}")
+    path = _shell_path(remote_path)
+    probe = int(max_bytes) + 1  # one extra byte tells us the file was longer
     if max_lines > 0:
-        cmd = f"head -n {int(max_lines)} {safe_path}"
+        script = f"head -n {int(max_lines)} -- {path} | head -c {probe}"
     else:
-        cmd = f"cat {safe_path}"
+        script = f"head -c {probe} -- {path}"
 
-    return _run_ssh(host, cmd)
+    rc, out, err = _run_ssh_script_raw(host, script)
+    if rc != 0:
+        result = _format_result(rc, out, err)
+        return result + (_diagnose_ssh_failure(host, err) if rc == SSH_OWN_FAILURE_RC else "")
+    if "\x00" in out:
+        return (
+            f"{remote_path} looks like a binary file (NUL bytes in the first {len(out)} bytes). "
+            "Use scp_download_file to fetch it instead of reading it into context."
+        )
+    if len(out) > max_bytes:
+        return out[:max_bytes] + (
+            f"\n[truncated at {max_bytes} bytes; the file is longer. Use max_lines, "
+            "a larger max_bytes, tail_remote_file for the end, or scp_download_file for all of it]"
+        )
+    return _format_result(rc, out, err)
 
 
 @mcp.tool()
@@ -448,14 +499,14 @@ def tail_remote_file(
 
     Args:
         host: SSH config alias or hostname.
-        remote_path: Absolute or relative path to the file on the remote host.
+        remote_path: Path on the remote host. Absolute paths are safest; '~/x' is
+            expanded to the remote home directory.
         lines: Number of lines to read from the end (default 50).
     """
     _validate_host(host)
     if lines < 1:
         raise ValueError(f"lines must be >= 1, got {lines}")
-    safe_path = shlex.quote(remote_path)
-    return _run_ssh(host, f"tail -n {int(lines)} {safe_path}")
+    return _run_ssh_script(host, f"tail -n {int(lines)} -- {_shell_path(remote_path)}")
 
 
 @mcp.tool()
