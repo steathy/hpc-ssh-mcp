@@ -523,3 +523,39 @@ class TestRecordHostPreservesWhatItDoesNotUnderstand:
         store.write_text(json.dumps(HAND_WRITTEN))
         assert ssh_hpc_server._host_settings("derecho") == {"center": "ncar", "note": "a list the server ignores"}
         assert ssh_hpc_server._host_settings("odd:alias") == {}
+
+
+# ---------------------------------------------------------------------------
+# F16: the first-use notice belongs to command tools, once
+# ---------------------------------------------------------------------------
+# It was appended inside _run_ssh_checked, so the poll cache stored it and
+# replayed the "say this once" notice for thirty seconds, and tail_remote_file
+# returned it glued to the file's last lines while read_remote_file never did.
+# Command tools carry it; file tools and the cache do not.
+
+class TestOnboardingNoticePlacement:
+    def test_a_cached_poll_does_not_replay_it(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="JOBID PARTITION\n")
+        first = ssh_hpc_server.list_queue("newbox", scheduler="slurm")
+        second = ssh_hpc_server.list_queue("newbox", scheduler="slurm")
+        assert "[first use" in first
+        assert "[cached" in second and "[first use" not in second, second
+
+    def test_tail_returns_only_the_file(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="last line\n")
+        assert ssh_hpc_server.tail_remote_file("newbox", "/tmp/x.log") == "last line\n"
+
+    def test_read_returns_only_the_file(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="content\n", stderr="8\n")
+        assert ssh_hpc_server.read_remote_file("newbox", "/tmp/x.log") == "content\n"
+
+    @pytest.mark.parametrize("call", [
+        lambda: ssh_hpc_server.execute_remote_bash("newbox", "echo hi"),
+        lambda: ssh_hpc_server.check_job("newbox", "123", scheduler="slurm"),
+        lambda: ssh_hpc_server.cancel_job("newbox", "123", scheduler="slurm"),
+        lambda: ssh_hpc_server.run_on_compute("newbox", "echo hi", scheduler="slurm"),
+        lambda: ssh_hpc_server.submit_job("newbox", "#!/bin/bash\n", scheduler="slurm"),
+    ])
+    def test_command_tools_carry_it_on_first_use(self, mock_subprocess, call):
+        mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
+        assert "[first use of 'newbox'" in call()

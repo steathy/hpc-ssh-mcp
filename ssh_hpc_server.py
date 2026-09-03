@@ -337,7 +337,7 @@ def _run_ssh_checked(
     formatted = _format_result(rc, out, err)
     if rc == SSH_OWN_FAILURE_RC:
         formatted += _diagnose_ssh_failure(host, err)
-    return rc == 0, formatted + _onboarding_notice(host)
+    return rc == 0, formatted
 
 
 def _run_ssh(
@@ -1095,7 +1095,7 @@ def execute_remote_bash(
     )
     if refusal:
         return refusal
-    return _run_ssh_script(host, command, timeout=timeout)
+    return _run_ssh_script(host, command, timeout=timeout) + _onboarding_notice(host)
 
 
 # ---------------------------------------------------------------------------
@@ -1235,7 +1235,7 @@ def submit_job(
             f"\n[submitted from the SSH login directory. For run data, pass "
             f"remote_dir={scratch} so output lands on scratch instead of $HOME.]"
         )
-    return result
+    return result + _onboarding_notice(host)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -1273,7 +1273,7 @@ def check_job(host: str, job_id: str, scheduler: str = "auto") -> str:
             "echo '=== sacct (accounting) ==='\n"
             f"sacct -j {sid} --format=JobID,JobName,Partition,State,ExitCode,Elapsed,Start,End --parsable2\n"
         )
-    return _cached_poll(("job", host, script), lambda: _run_ssh_script_checked(host, script))
+    return _cached_poll(("job", host, script), lambda: _run_ssh_script_checked(host, script)) + _onboarding_notice(host)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -1300,7 +1300,7 @@ def list_queue(host: str, user: str = "", scheduler: str = "auto") -> str:
         script = f"qstat -w -u {who}"
     else:
         script = f"squeue -u {who} --format='{_SQUEUE_FORMAT}'"
-    return _cached_poll(("queue", host, script), lambda: _run_ssh_script_checked(host, script))
+    return _cached_poll(("queue", host, script), lambda: _run_ssh_script_checked(host, script)) + _onboarding_notice(host)
 
 
 @mcp.tool(annotations=_OVERWRITES)
@@ -1315,7 +1315,7 @@ def cancel_job(host: str, job_id: str, scheduler: str = "auto") -> str:
     _validate_host(host)
     sched = _resolve_scheduler(host, scheduler)
     sid = _validate_job_id(job_id, sched)
-    return _run_ssh_script(host, f"qdel {sid}" if sched == "pbs" else f"scancel {sid}")
+    return _run_ssh_script(host, f"qdel {sid}" if sched == "pbs" else f"scancel {sid}") + _onboarding_notice(host)
 
 
 @mcp.tool(annotations=_ARBITRARY)
@@ -1395,7 +1395,7 @@ def run_on_compute(
     result = _run_ssh_script(host, " ".join(parts), timeout=timeout)
     if _TIMEOUT_ORPHAN_NOTE in result:
         result += _COMPUTE_TIMEOUT_NOTE
-    return result
+    return result + _onboarding_notice(host)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -1987,7 +1987,11 @@ printf 'globus=%s\n' "$g"
 
 
 def _onboarding_notice(host: str) -> str:
-    """Once per host per session, flag that nothing is recorded for this host."""
+    """Once per host per session, flag that nothing is recorded for this host.
+
+    Appended by the command tools, not by the ssh helpers: a file tool's result is
+    the file, and the poll cache must not store and replay a one-time notice.
+    """
     if host in _ONBOARDING_SEEN or _host_settings(host):
         _ONBOARDING_SEEN.add(host)
         return ""
