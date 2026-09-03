@@ -278,7 +278,7 @@ Every command sent through `execute_remote_bash` or `run_on_compute` is sorted i
 
 | Tier | Examples | What happens |
 |---|---|---|
-| **block** | `sudo`, `su`, `apt`/`yum`/`dnf`; `rm -rf` on `/`, `~`, `$HOME`, `/glade`, `/scratch`, `/pl`, `/projects`; recursive traversal (`find`, `du`, `ls -R`, `grep -r`, `rg`, `tree`) at or above a shared root; fork bombs; `mkfs`; `dd of=/dev/...`; writes to `authorized_keys` | Refused. |
+| **block** | `sudo`, `su`, `apt`/`yum`/`dnf` install or remove; `rm -rf` on `/`, `~`, `$HOME`, `/glade`, `/scratch`, `/pl`, `/projects`; recursive traversal (`find`, `du`, `ls -R`, `grep -r`, `rg`, `tree`) at or above a shared root; fork bombs; `mkfs`; `dd of=/dev/...`; writes to `authorized_keys` | Refused. |
 | **confirm** | `rm -r` elsewhere, `find -delete`, recursive `chmod`/`chown`, `chmod 777`, unbounded `make -j`, `git push --force`, `git reset --hard`, `scancel -u`, `qdel $(qselect ...)`, `truncate`, `shred`, `crontab`, `ssh-keygen`, redirects over `.nc`/`.h5` files | Refused unless called with `confirm_destructive=true`. The agent has to ask you first. |
 | **route** | interpreters running a script, compilers and `make`, MPI launchers, NCO/CDO tools, `conda`/`pip install`, `tar`/`zip`, `rsync`, `jupyter`, `nohup`, `tail -f`, `watch` | On a login or data-access node, refused with a pointer to `run_on_compute`; `allow_on_login_node=true` overrides for genuinely small cases. |
 | **free** | `ls`, `cat`, `grep`, `qstat`, `squeue`, `module avail`, `python --version`, `git status` | Runs. |

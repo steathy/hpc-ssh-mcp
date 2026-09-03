@@ -674,10 +674,17 @@ _COMPUTE_ROLES = ("login",)  # transfers are the point of a DTN
 _SEGMENT_RULES = (
     # --- block -------------------------------------------------------------
     (re.compile(r"^(?:sudo|sudoedit|su)(?:\s|$)"), "block", "sudo / su (privilege escalation)", None),
-    (re.compile(r"^(?:apt|apt-get|aptitude|yum|dnf|zypper|pacman|rpm)\s"), "block",
-     "system package manager (use conda/spack in your own space)", None),
+    # Only the mutating verbs: `rpm -qa` and `dnf list installed` are how you find
+    # out what a login node has, and a non-root user cannot install anyway.
+    (re.compile(r"^(?:apt|apt-get|aptitude)\s+(?:install|remove|purge|upgrade|dist-upgrade|autoremove)\b"
+                r"|^(?:yum|dnf|zypper)\s+(?:install|remove|erase|update|upgrade|reinstall|downgrade|autoremove)\b"
+                r"|^pacman\s+-[A-Za-z]*[SRU]"
+                r"|^rpm\s+-[A-Za-z]*[iUeF]"), "block",
+     "system package manager install/remove (use conda/spack in your own space)", None),
     (re.compile(r"^mkfs(?:\.\w+)?\s"), "block", "mkfs (filesystem creation)", None),
-    (re.compile(r"^dd\b[^|]*\bof=/dev/"), "block", "dd writing to a device node", None),
+    # /dev/null and the standard streams are sinks, not devices that can be damaged.
+    (re.compile(r"^dd\b[^|]*\bof=/dev/(?!null\b|stdout\b|stderr\b)"), "block",
+     "dd writing to a device node", None),
     (re.compile(r"(?:>>?\s*|tee\s+(?:-a\s+)?)(?:\S*/)?authorized_keys(?:\s|$)"), "block",
      "write to authorized_keys (SSH key persistence)", None),
     (re.compile(r"^sed\s+-i\b[^;]*authorized_keys"), "block",
@@ -767,8 +774,11 @@ def _traversal_tier(segment: str) -> tuple[str, str] | None:
     args = tokens[2:] if name == "lfs find" else tokens[1:]
 
     if name in _NEEDS_RECURSIVE_FLAG:
+        # grep recurses on -r or -R; ls only on -R, since its -r is *reverse sort*
+        # and `ls -ltr <shared root>` is one of the commonest login-node commands.
+        letters = "R" if name == "ls" else "rR"
         recursive = any(
-            tok.startswith("-") and not tok.startswith("--") and re.search(r"[rR]", tok)
+            tok.startswith("-") and not tok.startswith("--") and re.search(f"[{letters}]", tok)
             for tok in args
         ) or "--recursive" in args
         if not recursive:

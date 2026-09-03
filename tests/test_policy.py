@@ -235,3 +235,53 @@ class TestRouteTier:
         assert t == "block" and "sudo" in rule
         t, rule = _classify_command("python train.py", "login")
         assert t == "route" and "python" in rule.lower()
+
+
+# ---------------------------------------------------------------------------
+# Round 1 (v1.10.0) F1, F2: the block tier is no wider than the harm it names
+# ---------------------------------------------------------------------------
+# `block` has no override in strict mode, so a false positive here is a command
+# nobody can run through this server. `ls -r` is *reverse sort*, not recursion;
+# `rpm -qa` mutates nothing; /dev/null is a sink, not a device that can be
+# damaged.
+
+class TestBlockTierIsNoWiderThanItsHarm:
+    @pytest.mark.parametrize("cmd", [
+        "ls -ltr /glade/work",
+        "ls -lrt /projects",
+        "ls -ltr /scratch/alpine",
+        "ls -lr /home",
+        "rpm -qa | grep -i openmpi",
+        "rpm -ql glibc",
+        "dnf list installed",
+        "apt list --installed",
+        "yum info gcc",
+        "zypper search netcdf",
+    ])
+    def test_read_only_forms_are_free(self, cmd):
+        assert tier(cmd) == "free", cmd
+
+    def test_dd_to_dev_null_is_only_the_ordinary_dd_confirmation(self):
+        t, rule = _classify_command("dd if=big.nc of=/dev/null bs=1M", "login")
+        assert t == "confirm", (t, rule)
+        assert "device" not in rule, rule
+
+    @pytest.mark.parametrize("cmd", [
+        "ls -R /glade/work",
+        "ls -lR /glade/work",
+        "ls --recursive /glade/work",
+        "grep -r pattern /glade/work",
+        "apt install foo",
+        "apt-get install -y gcc",
+        "yum install python3",
+        "dnf remove vim",
+        "zypper install foo",
+        "pacman -S foo",
+        "rpm -Uvh pkg.rpm",
+        "rpm -ivh pkg.rpm",
+        "rpm -e pkg",
+        "dd if=/dev/zero of=/dev/sda bs=1M",
+        "dd if=img.iso of=/dev/nvme0n1",
+    ])
+    def test_the_real_thing_still_blocks(self, cmd):
+        assert tier(cmd) == "block", cmd
