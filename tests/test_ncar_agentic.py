@@ -117,33 +117,30 @@ class TestNcarSpecificRules:
 # The human-controlled policy escape
 # ---------------------------------------------------------------------------
 
-POLICY_TOML = """
-[policy]
-mode = "strict"
+POLICY_SSH_CONFIG = """
+Host derecho
+    HostName derecho.hpc.ucar.edu
+    # hpc-mcp: center=ncar role=login
 
-[derecho]
-center = "ncar"
-role   = "login"
+Host my-box
+    HostName 10.0.0.5
+    # hpc-mcp: role=workstation policy=off
 
-[my-box]
-role   = "workstation"
-policy = "off"
-
-[loose]
-role   = "login"
-policy = "permissive"
+Host loose
+    HostName loose.example.edu
+    # hpc-mcp: role=login policy=permissive
 """
 
 
 @pytest.fixture
 def policy_profiles(tmp_path, monkeypatch):
-    path = tmp_path / "hosts.toml"
-    path.write_text(POLICY_TOML)
-    monkeypatch.setenv("HPC_SSH_MCP_CONFIG", str(path))
+    path = tmp_path / "config"
+    path.write_text(POLICY_SSH_CONFIG)
+    monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(path))
     monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-    ssh_hpc_server._PROFILE_CACHE = None
+    ssh_hpc_server._DIRECTIVE_CACHE = None
     yield path
-    ssh_hpc_server._PROFILE_CACHE = None
+    ssh_hpc_server._DIRECTIVE_CACHE = None
 
 
 class TestPolicyMode:
@@ -163,9 +160,9 @@ class TestPolicyMode:
         assert _policy_mode("derecho") == "strict"
 
     def test_no_config_at_all_is_strict(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HPC_SSH_MCP_CONFIG", str(tmp_path / "absent.toml"))
+        monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(tmp_path / "absent"))
         monkeypatch.delenv("HPC_SSH_MCP_POLICY", raising=False)
-        ssh_hpc_server._PROFILE_CACHE = None
+        ssh_hpc_server._DIRECTIVE_CACHE = None
         assert _policy_mode("anything") == "strict"
 
 
@@ -198,8 +195,8 @@ class TestPolicyModeChangesEnforcement:
 
     def test_strict_refusal_tells_the_human_how_to_relax_it(self, policy_profiles):
         refusal = execute_remote_bash(host="derecho", command="sudo ls")
-        assert "hosts.toml" in refusal
-        assert "policy" in refusal
+        assert "~/.ssh/config" in refusal
+        assert "policy=permissive" in refusal
         assert "HPC_SSH_MCP_POLICY" in refusal
 
     def test_the_model_cannot_change_the_mode_through_a_tool(self):

@@ -32,21 +32,26 @@ from ssh_hpc_server import (
 GLADE = "d33b3614-6d04-11e5-ba46-22000b92c6ec"
 ALPINE = "aa3b3614-6d04-11e5-ba46-22000b92c6ff"
 
-PROFILE_TOML = f"""
-[globus.collections]
-glade = "{GLADE}"
-alpine = "{ALPINE}"
+SSH_CONFIG = f"""
+Host glade
+    HostName derecho.hpc.ucar.edu
+    # hpc-mcp: center=ncar globus={GLADE}
+
+Host alpine
+    HostName login.rc.colorado.edu
+    # hpc-mcp: center=curc globus={ALPINE}
 """
 
 
 @pytest.fixture
 def profiles(tmp_path, monkeypatch):
-    path = tmp_path / "hosts.toml"
-    path.write_text(PROFILE_TOML)
-    monkeypatch.setenv("HPC_SSH_MCP_CONFIG", str(path))
-    ssh_hpc_server._PROFILE_CACHE = None
+    """Globus collections are named by their annotated SSH host alias."""
+    path = tmp_path / "config"
+    path.write_text(SSH_CONFIG)
+    monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(path))
+    ssh_hpc_server._DIRECTIVE_CACHE = None
     yield path
-    ssh_hpc_server._PROFILE_CACHE = None
+    ssh_hpc_server._DIRECTIVE_CACHE = None
 
 
 @pytest.fixture
@@ -101,6 +106,10 @@ class TestCollectionResolution:
             _resolve_collection("campaign")
         assert "glade" in str(exc.value)
         assert "globus_find_collection" in str(exc.value)
+
+    def test_a_host_without_a_globus_annotation_is_not_a_collection(self, profiles):
+        with pytest.raises(ValueError):
+            _resolve_collection("some-plain-host")
 
     @pytest.mark.parametrize("bad", ["", "not-a-uuid", "../etc", "abc; rm -rf /", "-x"])
     def test_malformed_values_are_rejected(self, profiles, bad):

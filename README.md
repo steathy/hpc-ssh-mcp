@@ -16,20 +16,18 @@ It shells out to the system `ssh` and `scp` binaries rather than using a Python 
 - [Connect your coding agent](#connect-your-coding-agent)
 - [Tools](#tools)
 - [Command policy](#command-policy)
-- [Host profiles](#host-profiles)
+- [Host metadata](#host-metadata-in-the-file-you-already-have)
 - [Globus transfers](#globus-transfers)
 - [Testing](#testing)
 - [Changelog](#changelog)
 
 ## SSH multiplexing: the part that makes this work
 
-HPC centers protect login nodes with two-factor authentication. NSF NCAR uses Duo; CU Boulder uses its own second factor. A second factor is designed to require a human, and an MCP server has no terminal to prompt at.
+HPC centers protect login nodes with two-factor authentication. A second factor is designed to require a human, and an MCP server has no terminal to prompt at.
 
 OpenSSH solves this with **connection multiplexing**. The first connection opens a long-lived *master* and leaves a control socket behind. Every later connection to the same host travels down that socket, skipping authentication entirely. You answer Duo once; the agent then runs hundreds of commands over the same authenticated channel.
 
-### 1. Configure it
-
-Add the multiplexing options to each HPC host in `~/.ssh/config`:
+Add these three options to each HPC host in `~/.ssh/config`, and create the socket directory once with `mkdir -p ~/.ssh/sockets && chmod 700 ~/.ssh/sockets`:
 
 ```sshconfig
 Host derecho
@@ -38,100 +36,26 @@ Host derecho
     ControlMaster auto
     ControlPath ~/.ssh/sockets/%r@%h-%p
     ControlPersist 48h
-
-Host casper
-    HostName casper.hpc.ucar.edu
-    User yourusername
-    ControlMaster auto
-    ControlPath ~/.ssh/sockets/%r@%h-%p
-    ControlPersist 48h
-
-Host ncar-data
-    HostName data-access.ucar.edu
-    User yourusername
-    ControlMaster auto
-    ControlPath ~/.ssh/sockets/%r@%h-%p
-    ControlPersist 48h
-
-Host cu-alpine
-    HostName login.rc.colorado.edu
-    User yourusername
-    ControlMaster auto
-    ControlPath ~/.ssh/sockets/%r@%h-%p
-    ControlPersist 48h
 ```
-
-What each option does:
 
 | Option | Meaning |
 |---|---|
 | `ControlMaster auto` | Reuse a running master if there is one, otherwise become the master. |
-| `ControlPath` | Where the control socket lives. `%r@%h-%p` expands to user@host-port, giving one socket per destination. |
-| `ControlPersist 48h` | Keep the master alive for 48 hours after the first connection exits. Without it, the socket dies with your first shell. |
+| `ControlPath` | Where the control socket lives. `%r@%h-%p` gives one socket per destination. If SSH says the path is too long, use `%C`, a fixed-length hash. |
+| `ControlPersist 48h` | Keep the master alive for 48 hours after the connection that created it exits. Without this the socket dies with your first shell. |
 
-Create the socket directory once, and keep it private:
+Then just connect normally: `ssh derecho`. Because of `ControlMaster auto`, that ordinary login *becomes* the master, and `ControlPersist` keeps it alive in the background after you log out. You do not need a special command. `ssh -fN derecho` does the same thing without giving you a shell, which is handy when you only want to re-arm the socket.
 
-```bash
-mkdir -p ~/.ssh/sockets && chmod 700 ~/.ssh/sockets
-```
-
-If `ssh` complains that the control path is too long, the socket path exceeded the operating system limit of about 104 characters. Use a shorter directory, or `ControlPath ~/.ssh/sockets/%C`, which is a fixed-length hash.
-
-### 2. Open the master, once per session
-
-From your own terminal, where you can answer the Duo prompt:
-
-```bash
-ssh -fN derecho
-```
-
-`-f` backgrounds the process after authenticating and `-N` runs no command, so this exists purely to hold the connection open. Answer Duo, and you are set for the next 48 hours.
-
-### 3. Verify it
-
-```bash
-ssh -O check derecho     # -> Master running (pid=12345)
-```
-
-The agent can run this too, through the `check_ssh_connection` tool. If it reports a live master, every other tool will work without prompting.
-
-### 4. When it breaks
-
-The master dies if you reboot, change networks, or let `ControlPersist` expire. Every tool then fails within ten seconds and tells you what to do, rather than hanging:
-
-```
-[EXIT CODE 255]
-stderr:
-Permission denied (publickey,keyboard-interactive).
-
-Hint: SSH auth failed for 'derecho'. The ControlMaster socket has likely expired...
-From your terminal (where Duo/MFA prompts can be answered), run:
-    ssh -fN derecho
-Then retry.
-```
-
-To close a master deliberately:
-
-```bash
-ssh -O exit derecho
-```
-
-Two options are applied to every connection the server opens: `BatchMode=yes`, so SSH never tries to prompt, and `ConnectTimeout=10`, so an unreachable host fails in seconds rather than minutes.
+When the master expires or the machine sleeps, tools fail within ten seconds and say so, rather than hanging. Connect once more and carry on. `ssh -O check derecho` reports whether a master is running, and the agent can ask the same question through `check_ssh_connection`.
 
 ## Platform support: Windows needs WSL
 
 | Platform | Status |
 |---|---|
-| Linux | Fully supported. |
-| macOS | Fully supported. |
-| **Windows, native** | **Not supported.** |
-| Windows via WSL | Fully supported. Use this. |
-
-Microsoft's Win32 port of OpenSSH does not implement connection multiplexing. `ControlMaster` and `ControlPath` are accepted in the config file but no master is ever created, because Windows does not provide the Unix domain socket the control path needs.
-
-The consequence is not slowness, it is that the server cannot work at all: every command would attempt a fresh authentication, Duo would prompt with nobody to answer, and the call would fail. Third-party Windows clients such as PuTTY have their own multiplexing schemes, but `ssh.exe` is what this server invokes.
-
-**Windows users should run everything inside WSL.** Install WSL 2, install `uv` and your coding agent *inside* the WSL distribution, keep `~/.ssh/config` in WSL's home directory rather than on the Windows filesystem, and launch the agent from a WSL shell. Putting the SSH config or the control socket on a Windows drive under `/mnt/c` is known to hang the socket, so keep both on the Linux filesystem.
+| Linux | Supported. |
+| macOS | Supported. |
+| **Windows, native** | **Not supported.** Win32 OpenSSH does not implement connection multiplexing, so every command would re-authenticate and Duo would prompt with nobody to answer. |
+| Windows via WSL | Supported. Install `uv` and your agent inside the WSL distribution and keep `~/.ssh/config` on the Linux filesystem, not under `/mnt/c`. |
 
 ## Install
 
@@ -294,12 +218,12 @@ Every product above accepts an `env` object beside `command` and `args`. In Code
 
 ```json
 "env": {
-  "HPC_SSH_MCP_CONFIG": "/home/you/.config/hpc-ssh-mcp/hosts.toml",
-  "HPC_SSH_MCP_POLICY": "strict"
+  "HPC_SSH_MCP_POLICY": "strict",
+  "HPC_SSH_MCP_SSH_CONFIG": "/home/you/.ssh/config"
 }
 ```
 
-`HPC_SSH_MCP_CONFIG` points at your [host profiles](#host-profiles); `HPC_SSH_MCP_POLICY` sets the [command policy](#command-policy) for the session.
+`HPC_SSH_MCP_POLICY` sets the [command policy](#command-policy) for the session. `HPC_SSH_MCP_SSH_CONFIG` points at a non-standard SSH config; the default is `~/.ssh/config`.
 
 ## Tools
 
@@ -327,7 +251,22 @@ Read-only tools carry the MCP `readOnlyHint` and `idempotentHint` annotations; t
 
 ### Scheduler support
 
-The job tools take `scheduler="auto"|"pbs"|"slurm"`. With `auto` the server probes the host once for `qsub` and `sbatch` and caches the answer, or skips the probe entirely when a [host profile](#host-profiles) names the center. Job IDs are validated per scheduler: `2426690.desched1` and `123[].desched1` on PBS, `12345`, `12345_0` and `12345.0` on Slurm.
+**You do not need to know which scheduler your cluster runs.** The job tools default to `scheduler="auto"`: the server asks the host once whether it has `qsub` or `sbatch`, caches the answer, and uses the matching commands. If neither exists it says so plainly.
+
+To check for yourself, ask the host the same question:
+
+```bash
+ssh derecho 'command -v qsub sbatch'
+```
+
+Whichever path comes back is the scheduler. As a shortcut for the systems in this README:
+
+| System | Scheduler | Submit | Queue | Cancel |
+|---|---|---|---|---|
+| NSF NCAR Derecho, Casper | PBS Pro | `qsub` | `qstat` | `qdel` |
+| CU Boulder Alpine, Blanca | Slurm | `sbatch` | `squeue` | `scancel` |
+
+Annotating the host with `center=ncar` or `center=curc` skips the probe entirely. You can also pass `scheduler="pbs"` or `scheduler="slurm"` to any job tool to override both. Job IDs are validated per scheduler: `2426690.desched1` and `123[].desched1` on PBS, `12345`, `12345_0` and `12345.0` on Slurm.
 
 `submit_job` accepts `remote_dir` so scripts are written to, and submitted from, a scratch or work directory rather than `$HOME`.
 
@@ -348,14 +287,15 @@ Scheduler queries are rate-limited to one identical query per host every 30 seco
 
 ### When you really do want to run a blocked command
 
-Sometimes the guard is wrong, or you know exactly what you are doing and accept the risk. The override is deliberately **not a tool parameter**: a rail the agent can disable on its own is not a rail. Only you can relax it, either in `hosts.toml`:
+Sometimes the guard is wrong, or you know exactly what you are doing and accept the risk. The override is deliberately **not a tool parameter**: a rail the agent can disable on its own is not a rail. Only you can relax it, either in `~/.ssh/config`:
 
-```toml
-[policy]
-mode = "strict"        # default, applies to every host
+```sshconfig
+Host my-workstation
+    HostName 10.0.0.5
+    # hpc-mcp: policy=off          # a machine you own and administer yourself
 
-[my-workstation]
-policy = "off"         # a machine you own and administer yourself
+Host *
+    # hpc-mcp: policy=strict       # the default, stated explicitly
 ```
 
 or for a single session, by launching the server with an environment variable:
@@ -372,19 +312,32 @@ or for a single session, by launching the server with an environment variable:
 
 A refusal in strict mode tells you these options, so you never have to come back here to find them. `permissive` is the useful middle ground on a cluster: nothing is silently prevented, and nothing dangerous happens without you saying yes.
 
-## Host profiles
+## Host metadata, in the file you already have
 
-An optional TOML file tells the server what each host is, so it skips the scheduler probe, defaults your account, and applies the right policy role. Copy [`hosts.example.toml`](hosts.example.toml) to `~/.config/hpc-ssh-mcp/hosts.toml`, or point `$HPC_SSH_MCP_CONFIG` at your own path.
+Your hosts are already described in `~/.ssh/config`, so there is no second config file to keep in sync. The few things SSH has no keyword for ride along in a comment inside the `Host` block:
 
-```toml
-[derecho]
-center  = "ncar"                          # ncar -> PBS, curc -> Slurm
-role    = "login"                         # login | data-access | compute | workstation
-account = "UABC0001"                      # default -A for run_on_compute / submit_job
-scratch = "/glade/derecho/scratch/$USER"  # suggested remote_dir for job output
+```sshconfig
+Host derecho
+    HostName derecho.hpc.ucar.edu
+    User yourusername
+    ControlMaster auto
+    ControlPath ~/.ssh/sockets/%r@%h-%p
+    ControlPersist 48h
+    # hpc-mcp: center=ncar role=login account=UABC0001 scratch=/glade/derecho/scratch/$USER
 ```
 
-`role = "data-access"` allows transfers while still routing compute away; `role = "workstation"` lifts login-node routing entirely for a machine you own. A missing or malformed file simply means no profiles.
+`ssh` ignores the comment; this server reads it. Every key is optional, and with no annotation at all the server probes for the scheduler and treats the host as a login node.
+
+| Key | Values | Effect |
+|---|---|---|
+| `center` | `ncar`, `curc` | Selects PBS or Slurm without probing the host. |
+| `role` | `login`, `data-access`, `compute`, `workstation` | Sets the [command policy](#command-policy) tier. `data-access` allows transfers while still routing compute away; `workstation` lifts login-node routing on a machine you own. |
+| `account` | project code | Default `-A` / `--account` for `run_on_compute` and `submit_job`. |
+| `scratch` | path | Suggested as `remote_dir` when `submit_job` is called without one. |
+| `globus` | collection UUID | Lets Globus tools name this SSH alias instead of a UUID. |
+| `policy` | `strict`, `permissive`, `off` | See [when you really do want to run a blocked command](#when-you-really-do-want-to-run-a-blocked-command). |
+
+Put several on one line or use several comment lines, whichever reads better. A `Host *` block sets a default for every host, and a specific block wins over it, exactly as SSH resolves its own options.
 
 ## Globus transfers
 
@@ -407,15 +360,14 @@ Hint: this collection needs a one-time data_access consent, granted from your ow
 Then retry.
 ```
 
-Put the UUIDs you use often in `hosts.toml` so calls can name them:
+Record a collection UUID on the Host block for that system, and the tools accept the SSH alias you already use:
 
-```toml
-[globus.collections]
-glade  = "d33b3614-6d04-11e5-ba46-22000b92c6ec"   # NCAR GLADE
-alpine = "..."                                     # CU Boulder Research Computing
+```sshconfig
+Host derecho
+    # hpc-mcp: globus=d33b3614-6d04-11e5-ba46-22000b92c6ec
 ```
 
-A transfer is then `globus_transfer(source="glade", source_path="/glade/work/me/run1", dest="alpine", dest_path="/scratch/alpine/me/run1", recursive=True)`. Transfers default to `--sync-level mtime`, so re-running one is idempotent. Mirroring with `--delete-destination-extra` requires `confirm_destructive=true`.
+A transfer is then `globus_transfer(source="derecho", source_path="/glade/work/me/run1", dest="cu-alpine", dest_path="/scratch/alpine/me/run1", recursive=True)`. A bare UUID always works too, and `globus_find_collection` looks one up by name. Transfers default to `--sync-level mtime`, so re-running one is idempotent. Mirroring with `--delete-destination-extra` requires `confirm_destructive=true`.
 
 ## Testing
 
@@ -431,9 +383,17 @@ The unit suite mocks `subprocess.run`. The live suite exists because several rea
 
 ## Version
 
-1.4.0
+1.5.0
 
 ## Changelog
+
+### 1.5.0
+
+**Breaking:** the `hosts.toml` file is gone. Host metadata now lives in a `# hpc-mcp:` comment inside the matching `Host` block of `~/.ssh/config`, so there is one file instead of two and no alias is listed twice. `HPC_SSH_MCP_CONFIG` is replaced by `HPC_SSH_MCP_SSH_CONFIG`, which points at a non-standard SSH config. Globus collections are named by an annotated SSH alias rather than a separate alias table.
+
+- `Host *` blocks and glob patterns work, resolved first-match-wins as SSH does.
+- `Include` directives are followed.
+- A missing, unreadable or malformed config is never an error; it just means no annotations.
 
 ### 1.4.0
 

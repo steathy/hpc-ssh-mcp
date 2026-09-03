@@ -7,6 +7,8 @@ and ControlMaster multiplex sockets (avoiding MFA re-prompts).
 Run with:  uv run ssh_hpc_server.py
 """
 
+import fnmatch
+import glob
 import json
 import os
 import re
@@ -14,13 +16,12 @@ import shlex
 import shutil
 import subprocess
 import time
-import tomllib
 import uuid
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
@@ -341,47 +342,104 @@ def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
-# Host profiles
+# Host metadata, read from ~/.ssh/config
 # ---------------------------------------------------------------------------
-# An optional TOML file keyed by SSH alias, so the server knows what a host is
-# instead of guessing. Everything in it is optional; an absent or malformed
-# file simply means "no profiles".
+# Every host is already described in ~/.ssh/config. Rather than ask for a
+# second file listing the same aliases again, the few things SSH has no
+# keyword for ride along in a comment inside the Host block:
 #
-#   ~/.config/hpc-ssh-mcp/hosts.toml   (override with $HPC_SSH_MCP_CONFIG)
+#   Host derecho
+#       HostName derecho.hpc.ucar.edu
+#       ControlMaster auto
+#       # hpc-mcp: center=ncar role=login account=UABC0001
 #
-#   [derecho]
-#   center  = "ncar"                          # ncar -> PBS, curc -> Slurm
-#   role    = "login"                         # login | data-access | dtn | compute | workstation
-#   account = "UABC0001"                      # default -A / --account
-#   scratch = "/glade/derecho/scratch/$USER"  # suggested job directory
+# Recognised keys, all optional:
+#   center   ncar | curc     picks PBS or Slurm without probing the host
+#   role     login | data-access | compute | workstation   sets the policy tier
+#   account  charged by run_on_compute and submit_job (-A / --account)
+#   scratch  suggested job directory, quoted back when submit_job gets none
+#   globus   collection UUID for this system, so tools can name the host alias
+#   policy   strict | permissive | off   (see _policy_mode)
+#
+# With no annotation the server probes for the scheduler and assumes a login
+# node, which is the safe default.
 
-DEFAULT_CONFIG_PATH = "~/.config/hpc-ssh-mcp/hosts.toml"
+DEFAULT_SSH_CONFIG = "~/.ssh/config"
+SSH_CONFIG_ENV_VAR = "HPC_SSH_MCP_SSH_CONFIG"
+_DIRECTIVE_MARKER_RE = re.compile(r"^#\s*hpc-mcp\s*:\s*(?P<body>.*)$", re.I)
+_HOST_LINE_RE = re.compile(r"^Host\s+(?P<patterns>.+?)\s*$", re.I)
+_INCLUDE_RE = re.compile(r"^Include\s+(?P<paths>.+?)\s*$", re.I)
 CENTER_SCHEDULERS = {"ncar": "pbs", "curc": "slurm"}
 # A data-access node or DTN is meant for moving data, so transfers are normal
 # there while compute is still routed away.
 _ROLE_ALIASES = {"data-access": "dtn", "datamover": "dtn", "transfer": "dtn"}
 VALID_ROLES = ("login", "dtn", "compute", "workstation")
 
-_PROFILE_CACHE: dict | None = None
+# [(host patterns, {key: value})], in file order. None = not yet parsed.
+_DIRECTIVE_CACHE: list | None = None
 
 
-def _load_profiles() -> dict:
-    """Read the profile file once. Any problem with it means 'no profiles'."""
-    global _PROFILE_CACHE
-    if _PROFILE_CACHE is None:
-        path = os.path.expanduser(os.environ.get("HPC_SSH_MCP_CONFIG", DEFAULT_CONFIG_PATH))
-        try:
-            with open(path, "rb") as fh:
-                loaded = tomllib.load(fh)
-            _PROFILE_CACHE = {k: v for k, v in loaded.items() if isinstance(v, dict)}
-        except (OSError, ValueError, tomllib.TOMLDecodeError):
-            _PROFILE_CACHE = {}
-    return _PROFILE_CACHE
+def _ssh_config_path() -> str:
+    return os.path.expanduser(os.environ.get(SSH_CONFIG_ENV_VAR) or DEFAULT_SSH_CONFIG)
 
 
-def _host_profile(host: str) -> dict:
-    """Profile for an SSH alias, or {} if the host is not described."""
-    return _load_profiles().get(host, {})
+def _parse_ssh_config(path: str, depth: int = 0) -> list:
+    """Return [(patterns, directives)] for each Host block carrying annotations."""
+    if depth > 8:  # a cycle in Include directives
+        return []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+
+    blocks, patterns, directives = [], [], {}
+
+    def flush():
+        if patterns and directives:
+            blocks.append((list(patterns), dict(directives)))
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        include = _INCLUDE_RE.match(line)
+        if include:
+            flush()
+            patterns, directives = [], {}
+            for pattern in include.group("paths").split():
+                base = os.path.expanduser(pattern)
+                if not os.path.isabs(base):
+                    base = os.path.join(os.path.dirname(path), base)
+                for found in sorted(glob.glob(base)):
+                    blocks.extend(_parse_ssh_config(found, depth + 1))
+            continue
+        host = _HOST_LINE_RE.match(line)
+        if host:
+            flush()
+            patterns, directives = host.group("patterns").split(), {}
+            continue
+        marker = _DIRECTIVE_MARKER_RE.match(line)
+        if marker and patterns:
+            for token in marker.group("body").split():
+                key, sep, value = token.partition("=")
+                if sep and key and value:
+                    directives[key.strip().lower()] = value.strip()
+    flush()
+    return blocks
+
+
+def _host_directives(host: str) -> dict:
+    """Annotations that apply to a host. First match wins, as in ssh_config."""
+    global _DIRECTIVE_CACHE
+    if _DIRECTIVE_CACHE is None:
+        _DIRECTIVE_CACHE = _parse_ssh_config(_ssh_config_path())
+    resolved: dict = {}
+    for patterns, directives in _DIRECTIVE_CACHE:
+        if any(fnmatch.fnmatch(host, pattern) for pattern in patterns):
+            for key, value in directives.items():
+                resolved.setdefault(key, value)
+    return resolved
 
 
 def _host_role(host: str) -> str:
@@ -390,7 +448,7 @@ def _host_role(host: str) -> str:
     Login is the safe default: it is what an HPC alias almost always points at,
     and it is the role with the strictest routing rules.
     """
-    role = str(_host_profile(host).get("role", "login"))
+    role = str(_host_directives(host).get("role", "login")).lower()
     role = _ROLE_ALIASES.get(role, role)
     return role if role in VALID_ROLES else "login"
 
@@ -406,13 +464,13 @@ POLICY_ENV_VAR = "HPC_SSH_MCP_POLICY"
 def _policy_mode(host: str) -> str:
     """'strict' (default), 'permissive' (block needs confirmation) or 'off'.
 
-    Resolution order: environment variable, per-host `policy`, global
-    [policy] mode, then strict.
+    Resolution order: the environment variable the server was launched with,
+    then a `policy=` annotation on the host (a `Host *` block sets a default
+    for everything), then strict.
     """
     for candidate in (
         os.environ.get(POLICY_ENV_VAR, ""),
-        _host_profile(host).get("policy", ""),
-        _load_profiles().get("policy", {}).get("mode", ""),
+        _host_directives(host).get("policy", ""),
     ):
         value = str(candidate).strip().lower()
         if value in POLICY_MODES:
@@ -423,12 +481,13 @@ def _policy_mode(host: str) -> str:
 
 
 _RELAX_INSTRUCTIONS = (
-    "\n\nIf this is deliberate and you accept the risk, it is the user's call to make, "
-    "not this server's, and not yours. They can relax the guard for a host in "
-    "hosts.toml:\n"
-    '    [<host>]\n    policy = "permissive"   # block tier becomes a confirmation\n'
-    '    policy = "off"          # no checks at all\n'
-    f"or for one session by launching the server with {POLICY_ENV_VAR}=permissive "
+    "\n\nIf this is deliberate and the user accepts the risk, it is their call to make, "
+    "not this server's and not yours. They can relax the guard for a host by adding a "
+    "comment to its block in ~/.ssh/config:\n"
+    "    Host <host>\n"
+    "        # hpc-mcp: policy=permissive   # block tier becomes a confirmation\n"
+    "        # hpc-mcp: policy=off          # no checks at all\n"
+    f"or for one session by launching this server with {POLICY_ENV_VAR}=permissive "
     f"(or {POLICY_ENV_VAR}=off). Ask them to do that; you cannot set it yourself."
 )
 
@@ -887,7 +946,7 @@ def _detect_scheduler(host: str) -> str:
 
 def _resolve_scheduler(host: str, scheduler: str) -> str:
     if scheduler == "auto":
-        center = str(_host_profile(host).get("center", "")).lower()
+        center = str(_host_directives(host).get("center", "")).lower()
         if center in CENTER_SCHEDULERS:
             return CENTER_SCHEDULERS[center]
         return _detect_scheduler(host)
@@ -972,7 +1031,7 @@ def submit_job(
 
     submit = f"qsub {safe_fn}" if sched == "pbs" else f"sbatch -- {safe_fn}"
     result = _run_ssh_script(host, enter + submit)
-    scratch = str(_host_profile(host).get("scratch", ""))
+    scratch = str(_host_directives(host).get("scratch", ""))
     if not remote_dir and scratch:
         result += (
             f"\n[submitted from the SSH login directory. For run data, pass "
@@ -1109,7 +1168,7 @@ def run_on_compute(
     _validate_directive("resources", resources)
     _validate_directive("walltime", walltime, _VALID_WALLTIME_RE)
     sched = _resolve_scheduler(host, scheduler)
-    account = account or str(_host_profile(host).get("account", ""))
+    account = account or str(_host_directives(host).get("account", ""))
     _validate_directive("account", account)
     quoted = shlex.quote(command)
     if sched == "pbs":
@@ -1332,20 +1391,29 @@ def _globus_env() -> dict:
 
 
 def _globus_collections() -> dict:
-    raw = _load_profiles().get("globus", {}).get("collections", {})
-    return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    """SSH alias -> collection UUID, from `# hpc-mcp: globus=<uuid>` annotations."""
+    if _DIRECTIVE_CACHE is None:
+        _host_directives("")  # populate the cache
+    found = {}
+    for patterns, directives in _DIRECTIVE_CACHE or []:
+        uuid_ = directives.get("globus")
+        if uuid_:
+            for pattern in patterns:
+                if "*" not in pattern and "?" not in pattern:
+                    found.setdefault(pattern, uuid_)
+    return found
 
 
 def _resolve_collection(value: str) -> str:
-    """Turn an alias from hosts.toml or a bare UUID into a collection UUID."""
+    """Turn an SSH host alias or a bare UUID into a collection UUID."""
     known = _globus_collections()
     if value in known:
         value = known[value]
     if not _UUID_RE.match(value or ""):
-        names = ", ".join(sorted(known)) or "(none configured)"
+        names = ", ".join(sorted(known)) or "(none annotated)"
         raise ValueError(
-            f"Unknown Globus collection: {value!r}. Expected a UUID or one of the aliases "
-            f"in the [globus.collections] table of your hosts.toml: {names}. "
+            f"Unknown Globus collection: {value!r}. Expected a collection UUID, or an SSH "
+            f"host alias annotated with `# hpc-mcp: globus=<uuid>` in ~/.ssh/config: {names}. "
             "Use globus_find_collection to look a collection up by name."
         )
     return value.lower()
@@ -1477,8 +1545,9 @@ def globus_find_collection(query: str) -> str:
     """Search Globus for a collection by name and return its UUID.
 
     Useful names: 'NCAR GLADE', 'NCAR Campaign Storage', 'NCAR Data Sharing
-    Service', 'CU Boulder Research Computing'. Put the UUIDs you use often in
-    the [globus.collections] table of hosts.toml so later calls can name them.
+    Service', 'CU Boulder Research Computing'. Record a UUID you use often as
+    `# hpc-mcp: globus=<uuid>` on that system's Host block in ~/.ssh/config,
+    and later calls can name the SSH alias instead.
 
     Args:
         query: Text to search collection names for.
@@ -1501,7 +1570,7 @@ def globus_ls(collection: str, path: str = "/") -> str:
     """List a directory on a Globus collection without touching a login node.
 
     Args:
-        collection: Collection UUID, or an alias from hosts.toml.
+        collection: Collection UUID, or an SSH host alias annotated with globus=<uuid>.
         path: Absolute path on that collection (default '/').
     """
     if not _globus_cli_available():
@@ -1542,9 +1611,9 @@ def globus_transfer(
     returns; poll it with globus_task_status.
 
     Args:
-        source: Source collection UUID or hosts.toml alias.
+        source: Source collection UUID, or an annotated SSH host alias.
         source_path: Absolute path on the source collection.
-        dest: Destination collection UUID or hosts.toml alias.
+        dest: Destination collection UUID, or an annotated SSH host alias.
         dest_path: Absolute path on the destination collection.
         recursive: Required when transferring a directory.
         sync_level: When to re-send a file that already exists at the
