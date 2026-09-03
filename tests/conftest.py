@@ -4,6 +4,16 @@ import subprocess
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolate_host_store(tmp_path, monkeypatch):
+    """No test may read or write the developer's real host store."""
+    import ssh_hpc_server
+    monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "isolated-hosts.conf"))
+    ssh_hpc_server._DIRECTIVE_CACHE = None
+    yield
+    ssh_hpc_server._DIRECTIVE_CACHE = None
+
+
 @pytest.fixture
 def mock_subprocess():
     """Patch subprocess.run and return the mock for configuration.

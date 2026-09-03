@@ -236,6 +236,6 @@ class TestDiagnosticHintAppearsInToolOutput:
 # ---------------------------------------------------------------------------
 
 class TestVersion:
-    def test_version_is_1_6_0(self):
+    def test_version_is_1_7_0(self):
         import ssh_hpc_server
-        assert ssh_hpc_server.__version__ == "1.6.0"
+        assert ssh_hpc_server.__version__ == "1.7.0"

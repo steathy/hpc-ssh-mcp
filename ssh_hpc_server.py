@@ -21,7 +21,7 @@ import uuid
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 mcp = FastMCP(name="SSH-HPC-Remote-Control", version=__version__)
 
@@ -366,6 +366,79 @@ def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT)
 # With no annotation the server probes for the scheduler and assumes a login
 # node, which is the safe default.
 
+# Annotations this server writes go here, never into ~/.ssh/config. That file
+# controls access to every host the user has; a mangled line, a replaced
+# symlink or a downgraded file mode would cost them far more than the
+# convenience is worth. This file is ours: deleting it loses nothing but the
+# defaults, and a hand-written annotation in ~/.ssh/config always wins over it.
+DEFAULT_STORE = "~/.config/hpc-ssh-mcp/hosts.conf"
+STORE_ENV_VAR = "HPC_SSH_MCP_STORE"
+_STORE_HEADER = (
+    "# Host settings written by hpc-ssh-mcp (annotate_host).\n"
+    "# One host per line:  <ssh alias>: key=value key=value\n"
+    "# Safe to edit or delete; a deleted host simply falls back to safe defaults.\n"
+    "# A `# hpc-mcp:` comment in ~/.ssh/config takes precedence over anything here.\n"
+)
+
+
+_ANNOTATION_KEYS = ("hpc", "center", "role", "account", "scratch", "globus", "policy")
+
+
+def _format_annotation(pairs: dict) -> str:
+    """key=value pairs in a stable, readable order."""
+    order = {key: i for i, key in enumerate(_ANNOTATION_KEYS)}
+    return " ".join(f"{k}={pairs[k]}" for k in sorted(pairs, key=lambda k: order.get(k, 99)))
+
+
+def _store_path() -> str:
+    return os.path.expanduser(os.environ.get(STORE_ENV_VAR) or DEFAULT_STORE)
+
+
+def _load_store() -> dict:
+    """Read the managed store. Any problem with it means 'no entries'."""
+    try:
+        with open(_store_path(), encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return {}
+    entries: dict = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        host, sep, body = line.partition(":")
+        host = host.strip()
+        if not sep or not host or not _VALID_HOST_RE.match(host):
+            continue
+        directives = {}
+        for token in body.split():
+            key, has, value = token.partition("=")
+            if has and key and value:
+                directives[key.strip().lower()] = value.strip()
+        if directives:
+            entries[host] = directives
+    return entries
+
+
+def _write_store(entries: dict) -> str | None:
+    """Replace the store atomically and privately. Returns an error, or None."""
+    path = _store_path()
+    body = "".join(
+        f"{host}: " + _format_annotation(directives) + "\n"
+        for host, directives in sorted(entries.items())
+    )
+    try:
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        temp = f"{path}.tmp"
+        handle = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(_STORE_HEADER + body)
+        os.replace(temp, path)
+    except OSError as exc:
+        return f"Could not write {path}: {exc}"
+    return None
+
+
 DEFAULT_SSH_CONFIG = "~/.ssh/config"
 SSH_CONFIG_ENV_VAR = "HPC_SSH_MCP_SSH_CONFIG"
 _DIRECTIVE_MARKER_RE = re.compile(r"^#\s*hpc-mcp\s*:\s*(?P<body>.*)$", re.I)
@@ -379,6 +452,8 @@ VALID_ROLES = ("login", "dtn", "compute")
 
 # [(host patterns, {key: value})], in file order. None = not yet parsed.
 _DIRECTIVE_CACHE: list | None = None
+# {host: {key: value}} from the managed store; loaded with _DIRECTIVE_CACHE.
+_STORE_CACHE: dict | None = None
 
 
 def _ssh_config_path() -> str:
@@ -398,7 +473,7 @@ def _parse_ssh_config(path: str, depth: int = 0) -> list:
     blocks, patterns, directives = [], [], {}
 
     def flush():
-        if patterns and directives:
+        if patterns:
             blocks.append((list(patterns), dict(directives)))
 
     for raw in lines:
@@ -432,16 +507,55 @@ def _parse_ssh_config(path: str, depth: int = 0) -> list:
 
 
 def _host_directives(host: str) -> dict:
-    """Annotations that apply to a host. First match wins, as in ssh_config."""
-    global _DIRECTIVE_CACHE
+    """Annotations that apply to a host.
+
+    A `# hpc-mcp:` comment in ~/.ssh/config comes first, matched and resolved
+    first-match-wins exactly as ssh resolves its own options, because that is
+    the user stating something by hand. Anything this server wrote to its own
+    store only fills in keys the user did not state.
+    """
+    global _DIRECTIVE_CACHE, _STORE_CACHE
     if _DIRECTIVE_CACHE is None:
         _DIRECTIVE_CACHE = _parse_ssh_config(_ssh_config_path())
+        _STORE_CACHE = _load_store()
     resolved: dict = {}
     for patterns, directives in _DIRECTIVE_CACHE:
         if any(fnmatch.fnmatch(host, pattern) for pattern in patterns):
             for key, value in directives.items():
                 resolved.setdefault(key, value)
+    for key, value in (_STORE_CACHE or {}).get(host, {}).items():
+        resolved.setdefault(key, value)
     return resolved
+
+
+def _ssh_config_annotations(host: str) -> dict:
+    """Only the annotations the user wrote by hand in ~/.ssh/config."""
+    if _DIRECTIVE_CACHE is None:
+        _host_directives(host)
+    resolved: dict = {}
+    for patterns, directives in _DIRECTIVE_CACHE or []:
+        if any(fnmatch.fnmatch(host, pattern) for pattern in patterns):
+            for key, value in directives.items():
+                resolved.setdefault(key, value)
+    return resolved
+
+
+def _ssh_config_knows(host: str) -> bool:
+    """True when ~/.ssh/config names this alias specifically.
+
+    A `Host *` block matches every string, so it says nothing about whether
+    the alias is real; only non-wildcard patterns count as knowing it.
+    """
+    if _DIRECTIVE_CACHE is None:
+        _host_directives(host)
+    return any(
+        any(
+            pattern == host or ("*" in pattern or "?" in pattern) and fnmatch.fnmatch(host, pattern)
+            and pattern.strip("*?") and fnmatch.fnmatch(host, pattern)
+            for pattern in patterns
+        )
+        for patterns, _ in _DIRECTIVE_CACHE or []
+    )
 
 
 _FALSEY = {"false", "no", "0", "off", "n"}
@@ -1908,9 +2022,6 @@ def probe_host(host: str) -> str:
     return "\n".join(lines)
 
 
-_ANNOTATION_KEYS = ("hpc", "center", "role", "account", "scratch", "globus", "policy")
-
-
 def _validate_annotation(key: str, value: str) -> None:
     """Values live in a single-line, space-separated comment, so keep them simple."""
     if re.search(r"\s", value):
@@ -1934,40 +2045,6 @@ def _validate_annotation(key: str, value: str) -> None:
         raise ValueError(f"Invalid globus collection UUID: {value!r}.")
 
 
-def _rewrite_annotation(text: str, host: str, annotation: str) -> tuple[str, str | None]:
-    """Return (new text, error). Replaces any existing annotation in host's block."""
-    lines = text.splitlines(keepends=True)
-    block_start = block_end = None
-    indent = "    "
-    for i, raw in enumerate(lines):
-        match = _HOST_LINE_RE.match(raw.strip())
-        if match:
-            if block_start is not None:
-                block_end = i
-                break
-            if host in match.group("patterns").split():
-                block_start = i
-    if block_start is None:
-        return text, (
-            f"{host!r} has no Host block in {_ssh_config_path()}, so there is nothing to "
-            f"annotate. Add one first, for example:\n\n    Host {host}\n"
-            f"        HostName <real hostname>\n        ControlMaster auto\n"
-            f"        ControlPath ~/.ssh/sockets/%r@%h-%p\n        ControlPersist 48h\n"
-        )
-    if block_end is None:
-        block_end = len(lines)
-
-    body = lines[block_start + 1:block_end]
-    for raw in body:
-        stripped = raw.strip()
-        if stripped and not stripped.startswith("#"):
-            indent = raw[:len(raw) - len(raw.lstrip())] or indent
-            break
-    kept = [raw for raw in body if not _DIRECTIVE_MARKER_RE.match(raw.strip())]
-    new_body = [f"{indent}# hpc-mcp: {annotation}\n"] + kept
-    return "".join(lines[:block_start + 1] + new_body + lines[block_end:]), None
-
-
 @mcp.tool(annotations=_ADDITIVE)
 def annotate_host(
     host: str,
@@ -1979,14 +2056,16 @@ def annotate_host(
     globus: str = "",
     policy: str = "",
 ) -> str:
-    """Record what a host is, as a `# hpc-mcp:` comment in ~/.ssh/config.
+    """Record what a host is, so later sessions do not have to guess.
 
     Only call this after probe_host and after the user has confirmed the
-    values: it edits their SSH config. A backup is written alongside the
-    file first, and nothing outside the host's own block is touched.
+    values. Written to this server's own file (~/.config/hpc-ssh-mcp/hosts.conf
+    by default), never to ~/.ssh/config: that file controls access to every
+    host the user has, and is not something a tool should be editing. A
+    `# hpc-mcp:` comment the user writes there by hand always wins over this.
 
     Args:
-        host: SSH config alias. A Host block for it must already exist.
+        host: SSH config alias.
         is_hpc: False for a machine that is not a shared HPC system. Login-node
             etiquette and the command policy stop applying there, and the
             HPC-only fields are ignored.
@@ -2025,38 +2104,37 @@ def annotate_host(
             "account, scratch, globus or policy."
         )
 
-    order = {key: i for i, key in enumerate(_ANNOTATION_KEYS)}
-    annotation = " ".join(f"{k}={pairs[k]}" for k in sorted(pairs, key=lambda k: order.get(k, 99)))
+    annotation = _format_annotation(pairs)
 
-    path = _ssh_config_path()
-    try:
-        with open(path, encoding="utf-8") as fh:
-            original = fh.read()
-    except OSError as exc:
-        return f"Could not read {path}: {exc}"
+    known_by_ssh = _ssh_config_knows(host)
+    overridden = sorted(set(pairs) & set(_ssh_config_annotations(host)))
 
-    updated, error = _rewrite_annotation(original, host, annotation)
+    entries = dict(_load_store())
+    entries[host] = pairs
+    error = _write_store(entries)
     if error:
         return error
-
-    backup = path + ".hpc-mcp.bak"
-    try:
-        with open(backup, "w", encoding="utf-8") as fh:
-            fh.write(original)
-        temp = path + ".hpc-mcp.tmp"
-        with open(temp, "w", encoding="utf-8") as fh:
-            fh.write(updated)
-        os.replace(temp, path)
-    except OSError as exc:
-        return f"Could not write {path}: {exc}"
 
     global _DIRECTIVE_CACHE
     _DIRECTIVE_CACHE = None
     _ONBOARDING_SEEN.add(host)
     _SCHEDULER_CACHE.pop(host, None)
-    return (
-        f"Annotated {host!r} in {path}:\n    # hpc-mcp: {annotation}\n"
-        f"Previous contents saved to {backup}."
+
+    notes = []
+    if not known_by_ssh:
+        notes.append(
+            f"Note: ~/.ssh/config has no Host block matching {host!r}, so nothing can connect "
+            "to it by that name yet. Check the alias is spelled the way the user connects."
+        )
+    if overridden:
+        notes.append(
+            "Note: ~/.ssh/config already sets " + ", ".join(overridden) + f" for {host!r} by "
+            "hand, and the ssh config wins, so those values here have no effect. Ask the user "
+            "to edit the comment there if they want them changed."
+        )
+    return "\n".join(
+        [f"Recorded {host!r} in {_store_path()}:", f"    {host}: {annotation}",
+         "~/.ssh/config was not modified."] + notes
     )
 
 

@@ -219,11 +219,12 @@ Every product above accepts an `env` object beside `command` and `args`. In Code
 ```json
 "env": {
   "HPC_SSH_MCP_POLICY": "strict",
-  "HPC_SSH_MCP_SSH_CONFIG": "/home/you/.ssh/config"
+  "HPC_SSH_MCP_SSH_CONFIG": "/home/you/.ssh/config",
+  "HPC_SSH_MCP_STORE": "/home/you/.config/hpc-ssh-mcp/hosts.conf"
 }
 ```
 
-`HPC_SSH_MCP_POLICY` sets the [command policy](#command-policy) for the session. `HPC_SSH_MCP_SSH_CONFIG` points at a non-standard SSH config; the default is `~/.ssh/config`.
+`HPC_SSH_MCP_POLICY` sets the [command policy](#command-policy) for the session. `HPC_SSH_MCP_SSH_CONFIG` points at a non-standard SSH config, read only. `HPC_SSH_MCP_STORE` moves the file `annotate_host` writes to.
 
 ## Tools
 
@@ -241,7 +242,7 @@ Every product above accepts an `env` object beside `command` and `args`. In Code
 | `scp_upload_file` | Upload a file via `scp` |
 | `check_ssh_connection` | Verify the ControlMaster socket is alive |
 | `probe_host` | Detect what a host is: scheduler, filesystems, account, Globus |
-| `annotate_host` | Record what a host is, as a comment in `~/.ssh/config` |
+| `annotate_host` | Record what a host is, in the server's own settings file |
 | `globus_status` | Which Globus identity this machine is logged in as |
 | `globus_find_collection` | Search Globus for a collection UUID by name |
 | `globus_ls` | List a directory on a Globus collection |
@@ -329,7 +330,9 @@ Host derecho
     # hpc-mcp: center=ncar role=login account=UABC0001 scratch=/glade/derecho/scratch/$USER
 ```
 
-`ssh` ignores the comment; this server reads it. Every key is optional, and with no annotation at all the server probes for the scheduler and treats the host as an HPC login node, which is the cautious reading.
+`ssh` ignores the comment; this server reads it and never writes to it. Every key is optional, and with no annotation at all the server probes for the scheduler and treats the host as an HPC login node, which is the cautious reading.
+
+There are two places these settings can come from: this comment, written by you, and `~/.config/hpc-ssh-mcp/hosts.conf`, written by [`annotate_host`](#letting-the-agent-fill-this-in). Yours wins, key by key.
 
 | Key | Values | Effect |
 |---|---|---|
@@ -349,9 +352,20 @@ You do not have to write these by hand. The first time a tool touches a host wit
 
 1. `probe_host` connects and reports what it finds: the scheduler, which of the known HPC filesystems are mounted, any project code in the environment, and whether the Globus CLI is installed. It proposes an annotation and lists what it cannot detect.
 2. The agent asks you the rest. Whether this really is a shared HPC system, which project code jobs should charge, and which policy level you want. It is told not to choose the policy for you.
-3. `annotate_host` writes your answers into the Host block. It backs the file up alongside it first, replaces any previous annotation, and touches nothing outside that one block.
+3. `annotate_host` records your answers.
 
-A `Host` block for the alias must already exist, since that is how you connect in the first place. Nothing is written until you have answered, and the notice is a nudge, not a gate: an unannotated host keeps working.
+**It does not write to `~/.ssh/config`, and nothing here ever will.** That file controls access to every host you have. A mangled line, a replaced symlink from a dotfile manager, or a downgraded file mode would cost you far more than the convenience is worth, so the server reads it and leaves it alone.
+
+Answers go to a small file the server owns, `~/.config/hpc-ssh-mcp/hosts.conf` (set `HPC_SSH_MCP_STORE` to move it), one line per host:
+
+```
+derecho: center=ncar role=login account=UABC0001
+laptop: hpc=false
+```
+
+Delete it, edit it, or check it into nothing at all: the worst case is that hosts fall back to safe defaults. And a `# hpc-mcp:` comment you write by hand in `~/.ssh/config` always beats it, so your own statement is never overridden by something a tool decided.
+
+Nothing is written until you have answered, and the notice is a nudge rather than a gate: an unannotated host keeps working.
 
 ## Globus transfers
 
@@ -397,9 +411,17 @@ The unit suite mocks `subprocess.run`. The live suite exists because several rea
 
 ## Version
 
-1.6.0
+1.7.0
 
 ## Changelog
+
+### 1.7.0
+
+**`annotate_host` no longer writes to `~/.ssh/config`.** Editing the file that controls access to every one of your hosts was the wrong place to put a convenience, and it had real bugs: writing through a symlinked config replaced the symlink and orphaned the dotfile behind it, the new file landed with the umask default rather than the original mode, and the single backup slot was overwritten by the next write.
+
+- Annotations now go to `~/.config/hpc-ssh-mcp/hosts.conf`, created private, atomically replaced, and disposable: deleting it only loses defaults. `HPC_SSH_MCP_STORE` moves it.
+- `~/.ssh/config` is still read, and a `# hpc-mcp:` comment you write there by hand takes precedence over anything the server wrote, key by key.
+- A `Host *` block no longer counts as ~/.ssh/config knowing an alias, so a typo'd host is flagged rather than silently accepted.
 
 ### 1.6.0
 

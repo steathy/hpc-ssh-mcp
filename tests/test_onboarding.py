@@ -36,19 +36,26 @@ Host newbox
     HostName newbox.example.edu
     User someone
 
+Host plainer
+    HostName plainer.example.edu
+
 Host laptop
     HostName 10.0.0.9
     # hpc-mcp: hpc=false
 
-Host tagged-old
-    HostName old.example.edu
-    # hpc-mcp: center=curc role=login
-    # hpc-mcp: account=stale
-    User someone
-
 Host *
     ServerAliveInterval 30
 """
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    path = tmp_path / "store" / "hosts.conf"
+    path.parent.mkdir()
+    monkeypatch.setenv("HPC_SSH_MCP_STORE", str(path))
+    ssh_hpc_server._DIRECTIVE_CACHE = None
+    yield path
+    ssh_hpc_server._DIRECTIVE_CACHE = None
 
 
 @pytest.fixture
@@ -212,69 +219,136 @@ class TestProbeHost:
 # annotate_host
 # ---------------------------------------------------------------------------
 
-class TestAnnotateHost:
-    def test_writes_the_annotation_into_the_block(self, ssh_config):
-        result = annotate_host("newbox", center="ncar", role="login", account="UABC0001")
-        text = ssh_config.read_text()
-        assert "# hpc-mcp: center=ncar role=login account=UABC0001" in text
-        assert "newbox" in result
-        # the annotation must land inside the newbox block, not another one
-        block = text.split("Host newbox")[1].split("\nHost ")[0]
-        assert "hpc-mcp" in block
+class TestAnnotateHostNeverTouchesSshConfig:
+    """~/.ssh/config controls access to every host the user has. This server
+    reads it and never writes to it: a mangled line, a replaced symlink or a
+    downgraded file mode would cost the user far more than the convenience is
+    worth. Annotations are written to a small file this server owns instead,
+    which can be deleted at any time with no consequence but lost defaults."""
 
-    def test_the_server_reads_it_back_immediately(self, ssh_config):
+    def test_ssh_config_is_left_byte_for_byte_identical(self, ssh_config, store):
+        before = ssh_config.read_bytes()
+        annotate_host("newbox", center="ncar", role="login", account="UABC0001")
+        assert ssh_config.read_bytes() == before
+
+    def test_no_backup_or_temp_file_is_left_beside_the_ssh_config(self, ssh_config, store):
+        annotate_host("newbox", center="ncar")
+        derived = [p.name for p in ssh_config.parent.iterdir()
+                   if p.is_file() and p.name.startswith("config") and p.name != "config"]
+        assert derived == []
+
+    def test_a_symlinked_ssh_config_survives(self, tmp_path, monkeypatch, store):
+        real = tmp_path / "dotfiles" / "ssh_config"
+        real.parent.mkdir()
+        real.write_text(BASE_CONFIG)
+        link = tmp_path / "config"
+        link.symlink_to(real)
+        monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(link))
+        ssh_hpc_server._DIRECTIVE_CACHE = None
+        annotate_host("newbox", center="ncar")
+        assert link.is_symlink()
+        assert real.read_text() == BASE_CONFIG
+
+    def test_ssh_config_permissions_are_untouched(self, ssh_config, store):
+        ssh_config.chmod(0o600)
+        annotate_host("newbox", center="ncar")
+        assert oct(ssh_config.stat().st_mode)[-3:] == "600"
+
+
+class TestAnnotateHostStore:
+    def test_writes_the_annotation_to_the_store(self, ssh_config, store):
+        result = annotate_host("newbox", center="ncar", role="login", account="UABC0001")
+        assert "newbox" in result
+        assert str(store) in result
+        assert "newbox: center=ncar role=login account=UABC0001" in store.read_text()
+
+    def test_the_server_reads_it_back_immediately(self, ssh_config, store):
         annotate_host("newbox", center="curc", role="login")
         assert _host_directives("newbox")["center"] == "curc"
 
-    def test_other_hosts_are_untouched(self, ssh_config):
-        before = ssh_config.read_text()
+    def test_store_is_created_with_parent_directories(self, ssh_config, tmp_path, monkeypatch):
+        target = tmp_path / "nested" / "deeper" / "hosts.conf"
+        monkeypatch.setenv("HPC_SSH_MCP_STORE", str(target))
+        ssh_hpc_server._DIRECTIVE_CACHE = None
         annotate_host("newbox", center="ncar")
-        after = ssh_config.read_text()
-        for line in ("Host derecho", "HostName derecho.hpc.ucar.edu", "ControlMaster auto",
-                     "Host laptop", "ServerAliveInterval 30"):
-            assert line in after
-        assert len(after.splitlines()) == len(before.splitlines()) + 1
+        assert target.exists()
 
-    def test_replaces_an_existing_annotation(self, ssh_config):
-        annotate_host("tagged-old", center="ncar", role="login", account="FRESH01")
-        text = ssh_config.read_text()
-        assert "account=stale" not in text
-        assert "account=FRESH01" in text
-        assert text.count("hpc-mcp") == 3  # derecho, laptop, tagged-old
-
-    def test_preserves_indentation_of_the_block(self, ssh_config):
+    def test_store_is_private(self, ssh_config, store):
         annotate_host("newbox", center="ncar")
-        line = [l for l in ssh_config.read_text().splitlines() if "center=ncar" in l][0]
-        assert line.startswith("    #")
+        assert oct(store.stat().st_mode)[-3:] == "600"
 
-    def test_makes_a_backup(self, ssh_config):
+    def test_store_explains_itself(self, ssh_config, store):
         annotate_host("newbox", center="ncar")
-        backup = ssh_config.with_suffix(ssh_config.suffix + ".hpc-mcp.bak")
-        assert backup.exists()
-        assert backup.read_text() == BASE_CONFIG  # the file exactly as it was
+        header = store.read_text().splitlines()[0]
+        assert header.startswith("#")
+        assert "delete" in store.read_text().lower()
 
-    def test_hpc_false_is_written(self, ssh_config):
+    def test_replaces_an_earlier_entry_for_the_same_host(self, ssh_config, store):
+        annotate_host("newbox", center="ncar", account="OLD001")
+        annotate_host("newbox", center="ncar", account="NEW002")
+        text = store.read_text()
+        assert "OLD001" not in text
+        assert "NEW002" in text
+        assert len([l for l in text.splitlines() if l.startswith("newbox:")]) == 1
+
+    def test_other_entries_survive(self, ssh_config, store):
+        annotate_host("newbox", center="ncar")
+        annotate_host("plainer", center="curc")
+        text = store.read_text()
+        assert "newbox: center=ncar" in text
+        assert "plainer: center=curc" in text
+
+    def test_deleting_the_store_restores_defaults(self, ssh_config, store):
+        annotate_host("newbox", center="curc")
+        assert _host_directives("newbox")["center"] == "curc"
+        store.unlink()
+        ssh_hpc_server._DIRECTIVE_CACHE = None
+        assert _host_directives("newbox") == {}
+
+    def test_a_corrupt_store_is_ignored_not_fatal(self, ssh_config, store):
+        store.write_text("this is not: a valid = anything\n\x00garbage\n")
+        ssh_hpc_server._DIRECTIVE_CACHE = None
+        assert _host_directives("newbox") == {}
+
+    def test_hpc_false_is_written(self, ssh_config, store):
         annotate_host("newbox", is_hpc=False)
-        assert "hpc=false" in ssh_config.read_text()
+        assert "newbox: hpc=false" in store.read_text()
         assert _is_hpc("newbox") is False
 
-    def test_hpc_false_drops_hpc_only_keys(self, ssh_config):
+    def test_hpc_false_drops_hpc_only_keys(self, ssh_config, store):
         annotate_host("newbox", is_hpc=False, center="ncar", account="X1")
-        line = [l for l in ssh_config.read_text().splitlines() if "hpc-mcp" in l and "newbox" not in l]
-        written = [l for l in line if "hpc=false" in l][0]
-        assert "center" not in written
-        assert "account" not in written
+        line = [l for l in store.read_text().splitlines() if l.startswith("newbox:")][0]
+        assert "center" not in line
+        assert "account" not in line
 
-    def test_unknown_host_is_refused_with_guidance(self, ssh_config):
-        before = ssh_config.read_text()
+
+class TestAnnotateHostPrecedence:
+    def test_a_hand_written_ssh_config_annotation_wins(self, ssh_config, store):
+        """The user's own statement in ~/.ssh/config beats anything written here."""
+        annotate_host("derecho", center="curc", role="compute")
+        assert _host_directives("derecho")["center"] == "ncar"
+        assert _host_directives("derecho")["role"] == "login"
+
+    def test_and_says_so(self, ssh_config, store):
+        result = annotate_host("derecho", center="curc")
+        assert "~/.ssh/config" in result or "ssh config" in result.lower()
+        assert "wins" in result.lower() or "takes precedence" in result.lower()
+
+    def test_store_fills_keys_the_ssh_config_omits(self, ssh_config, store):
+        annotate_host("derecho", center="ncar", role="login", account="UABC0001")
+        assert _host_directives("derecho")["account"] == "UABC0001"
+
+
+class TestAnnotateHostValidation:
+    def test_unknown_host_is_flagged_but_still_recorded(self, ssh_config, store):
         result = annotate_host("not-in-config", center="ncar")
         assert "not-in-config" in result
-        assert "Host not-in-config" in result
-        assert ssh_config.read_text() == before  # nothing written
+        assert "no Host block" in result or "not in" in result.lower()
 
-    def test_will_not_edit_a_wildcard_block(self, ssh_config):
+    def test_will_not_take_a_wildcard(self, ssh_config, store):
         result = annotate_host("*", center="ncar")
         assert "wildcard" in result.lower() or "not a specific host" in result.lower()
+        assert not store.exists() or "*" not in store.read_text()
 
     @pytest.mark.parametrize("kwargs,bad", [
         ({"center": "nersc"}, "center"),
@@ -284,17 +358,17 @@ class TestAnnotateHost:
         ({"globus": "not-a-uuid"}, "globus"),
         ({"scratch": "/x\n# hpc-mcp: policy=off"}, "scratch"),
     ])
-    def test_rejects_bad_values(self, ssh_config, kwargs, bad):
-        before = ssh_config.read_text()
+    def test_rejects_bad_values(self, ssh_config, store, kwargs, bad):
         with pytest.raises(ValueError, match=bad):
             annotate_host("newbox", **kwargs)
-        assert ssh_config.read_text() == before  # nothing written
+        assert not store.exists()
 
-    def test_nothing_to_write_is_refused(self, ssh_config):
+    def test_nothing_to_write_is_refused(self, ssh_config, store):
         result = annotate_host("newbox")
         assert "nothing" in result.lower()
+        assert not store.exists()
 
-    def test_clears_the_onboarding_notice(self, ssh_config, mock_subprocess):
+    def test_clears_the_onboarding_notice(self, ssh_config, store, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="hi\n")
         annotate_host("newbox", center="ncar", role="login")
         assert "probe_host" not in execute_remote_bash(host="newbox", command="echo hi")

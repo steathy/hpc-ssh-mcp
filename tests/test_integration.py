@@ -169,9 +169,12 @@ class TestLiveOnboarding:
 
     @pytest.fixture
     def scratch_config(self, tmp_path, monkeypatch):
+        """A throwaway ssh config and store. The real ~/.ssh/config is never
+        touched by these tests, and must never be touched by the code either."""
         cfg = tmp_path / "config"
         cfg.write_text(f"Host {HOST}\n    HostName {HOST}\n    ControlMaster auto\n")
         monkeypatch.setenv("HPC_SSH_MCP_SSH_CONFIG", str(cfg))
+        monkeypatch.setenv("HPC_SSH_MCP_STORE", str(tmp_path / "hosts.conf"))
         ssh_hpc_server._DIRECTIVE_CACHE = None
         ssh_hpc_server._ONBOARDING_SEEN.clear()
         yield cfg
@@ -184,12 +187,13 @@ class TestLiveOnboarding:
         assert "hostname" in out
         assert "annotate_host" in out or "is_hpc=False" in out
 
-    def test_annotate_round_trip(self, scratch_config):
-        assert "Annotated" in annotate_host(HOST, is_hpc=False)
-        assert "# hpc-mcp: hpc=false" in scratch_config.read_text()
+    def test_annotate_round_trip(self, scratch_config, tmp_path):
+        before = scratch_config.read_bytes()
+        assert "Recorded" in annotate_host(HOST, is_hpc=False)
+        assert f"{HOST}: hpc=false" in (tmp_path / "hosts.conf").read_text()
+        assert scratch_config.read_bytes() == before  # ssh config untouched
         assert ssh_hpc_server._is_hpc(HOST) is False
         assert ssh_hpc_server._policy_mode(HOST) == "off"
-        assert scratch_config.with_suffix(".hpc-mcp.bak").exists()
 
     def test_non_hpc_host_runs_a_routed_command_without_a_flag(self, scratch_config):
         annotate_host(HOST, is_hpc=False)
