@@ -1,8 +1,8 @@
 """The settings file this server writes is JSON.
 
 It is machine-written and machine-read, so it uses a format with a parser
-that already exists rather than a line syntax invented here. `~/.ssh/config`
-stays the place for hand-written annotations, and still wins over this.
+that already exists rather than a line syntax invented here. It is the only
+source of host settings: since 1.9.0 `~/.ssh/config` is not read at all.
 """
 
 import json

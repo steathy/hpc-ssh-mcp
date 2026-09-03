@@ -322,6 +322,18 @@ def _diagnose_ssh_failure(host: str, stderr: str) -> str:
     return ""
 
 
+def _format_ssh_result(host: str, rc: int, out: str, err: str) -> str:
+    """_format_result, plus the ControlMaster hint when ssh itself failed (exit 255).
+
+    Every remote result is reported through here so the hint cannot be forgotten
+    by one caller and worded differently by the next.
+    """
+    formatted = _format_result(rc, out, err)
+    if rc == SSH_OWN_FAILURE_RC:
+        formatted += _diagnose_ssh_failure(host, err)
+    return formatted
+
+
 def _run_ssh_checked(
     host: str,
     remote_cmd: str,
@@ -334,10 +346,7 @@ def _run_ssh_checked(
     as well as the text.
     """
     rc, out, err = _run_ssh_raw(host, remote_cmd, timeout=timeout, input_data=input_data)
-    formatted = _format_result(rc, out, err)
-    if rc == SSH_OWN_FAILURE_RC:
-        formatted += _diagnose_ssh_failure(host, err)
-    return rc == 0, formatted
+    return rc == 0, _format_ssh_result(host, rc, out, err)
 
 
 def _run_ssh(
@@ -422,10 +431,7 @@ def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT)
     gate applies.
     """
     rc, out, err = _run_raw(_scp_cmd(*scp_args), timeout=timeout)
-    formatted = _format_result(rc, out, err)
-    if rc == SSH_OWN_FAILURE_RC:
-        formatted += _diagnose_ssh_failure(host, err)
-    return rc, formatted
+    return rc, _format_ssh_result(host, rc, out, err)
 
 
 # ---------------------------------------------------------------------------
@@ -1118,10 +1124,7 @@ def _detect_scheduler(host: str) -> str:
     script = 'for s in qsub sbatch; do command -v "$s" >/dev/null 2>&1 && echo "$s"; done; true'
     rc, out, err = _run_ssh_script_raw(host, script)
     if rc != 0:
-        msg = f"Could not probe the scheduler on {host!r}:\n{_format_result(rc, out, err)}"
-        if rc == SSH_OWN_FAILURE_RC:
-            msg += _diagnose_ssh_failure(host, err)
-        raise ValueError(msg)
+        raise ValueError(f"Could not probe the scheduler on {host!r}:\n{_format_ssh_result(host, rc, out, err)}")
     found = set(out.split())
     has_pbs, has_slurm = "qsub" in found, "sbatch" in found
     if has_pbs and has_slurm:
@@ -1222,10 +1225,7 @@ def submit_job(
         input_data=job_script_content,
     )
     if rc != 0:
-        msg = f"Failed to write script to {remote_filename}:\n{_format_result(rc, out, err)}"
-        if rc == SSH_OWN_FAILURE_RC:
-            msg += _diagnose_ssh_failure(host, err)
-        return msg
+        return f"Failed to write script to {remote_filename}:\n{_format_ssh_result(host, rc, out, err)}"
 
     submit = f"qsub {safe_fn}" if sched == "pbs" else f"sbatch -- {safe_fn}"
     result = _run_ssh_script(host, enter + submit)
@@ -1448,8 +1448,7 @@ def read_remote_file(
 
     rc, out, err = _run_ssh_script_raw(host, script)
     if rc != 0:
-        result = _format_result(rc, out, err)
-        return result + (_diagnose_ssh_failure(host, err) if rc == SSH_OWN_FAILURE_RC else "")
+        return _format_ssh_result(host, rc, out, err)
     if "\x00" in out:
         return (
             f"{remote_path} looks like a binary file (NUL bytes in the first "
@@ -1697,9 +1696,7 @@ def _consent_hint(stderr: str) -> str:
     )
 
 
-def _globus_auth_hint(stderr: str) -> str:
-    """Translate a CLI auth failure into the command that fixes it."""
-    return _consent_hint(stderr) or f"\n\nHint: {_LOGIN_STEPS}\nThen retry."
+_LOGIN_HINT = f"\n\nHint: {_LOGIN_STEPS}\nThen retry."
 
 
 def _run_globus(args: list[str], timeout: int = DEFAULT_GLOBUS_TIMEOUT) -> tuple[int, str, str]:
@@ -1719,7 +1716,7 @@ def _globus_json(args: list[str], timeout: int = DEFAULT_GLOBUS_TIMEOUT):
         summary = f"{body.get('code')}: {body.get('message')}" if body.get("code") else None
         msg = summary or _format_result(rc, out, err)
         # ConsentRequired arrives on exit 1, so check it before the exit code.
-        msg += _consent_hint(err) or (_globus_auth_hint(err) if rc == GLOBUS_EXIT_AUTH else "")
+        msg += _consent_hint(err) or (_LOGIN_HINT if rc == GLOBUS_EXIT_AUTH else "")
         return None, msg
     try:
         return json.loads(out or "null"), None
@@ -1744,7 +1741,6 @@ def _human_bytes(n) -> str:
         if abs(n) < 1000 or unit == "TB":
             return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
         n /= 1000
-    return f"{n:.1f} TB"
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -2068,10 +2064,7 @@ def probe_host(host: str) -> str:
     existing = _host_settings(host)
     rc, out, err = _run_ssh_script_raw(host, _PROBE_SCRIPT)
     if rc != 0:
-        msg = f"Could not probe {host!r}:\n{_format_result(rc, out, err)}"
-        if rc == SSH_OWN_FAILURE_RC:
-            msg += _diagnose_ssh_failure(host, err)
-        return msg
+        return f"Could not probe {host!r}:\n{_format_ssh_result(host, rc, out, err)}"
 
     fields = {}
     for line in out.splitlines():
@@ -2084,7 +2077,7 @@ def probe_host(host: str) -> str:
     if existing:
         lines.append(
             f"{host!r} already has settings recorded: "
-            + " ".join(f"{k}={v}" for k, v in sorted(existing.items()))
+            + _format_settings(existing)
             + ". Recording again updates the keys you pass and leaves the rest.\n"
         )
     lines += [

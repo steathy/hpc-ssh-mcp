@@ -90,11 +90,16 @@ class TestSubprocessBoundary:
 
 
 # ---------------------------------------------------------------------------
-# Trap: the policy is registries keyed by string, which no type checker sees
+# Trap: the ssh failure hint drifting back into copies
 # ---------------------------------------------------------------------------
-# A misspelled tier is a KeyError in TIER_ORDER at call time, not at import,
-# and only for the one command that trips that rule.
+# "format the result, and on exit 255 add the ControlMaster hint" was written out
+# six times (round 1 of 1.10.0, F18). One helper carries it; check_ssh_connection
+# is the local socket query and attaches the hint on its own terms.
 
+class TestOneFormatterForSshFailures:
+    def test_the_hint_is_attached_in_one_place(self):
+        callers = _functions_containing(lambda n: _is_call_to(n, "_diagnose_ssh_failure"))
+        assert callers == {"_format_ssh_result", "check_ssh_connection"}, callers
 
 
 # ---------------------------------------------------------------------------
@@ -144,12 +149,6 @@ class TestPolicyRegistryIsWellFormed:
                     tier, rule = hit
                     assert tier in ssh_hpc_server.TIER_ORDER, (func.__name__, tier)
                     assert isinstance(rule, str) and rule, (func.__name__, rule)
-
-
-# ---------------------------------------------------------------------------
-# Trap: the settings vocabulary is written in three places
-# ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +209,6 @@ class TestDocsListEveryTool:
                     if _is_call_to(d, "mcp.tool"):
                         kwargs = {k.arg for k in d.keywords}
                         assert "annotations" in kwargs, node.name
-
-
-# ---------------------------------------------------------------------------
-# Trap: an environment variable added without a row in the docs
-# ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +338,6 @@ class TestTheSdistShipsOnlyTheReadme:
 # Returning a cached answer for a read is rate limiting; returning one for a
 # write means the write silently did not happen.
 
-
-
-# ---------------------------------------------------------------------------
-# Trap: the poll limiter must never wrap a mutating tool
-# ---------------------------------------------------------------------------
-# Returning a cached answer for a read is rate limiting; returning one for a
-# write means the write silently did not happen.
-
 class TestCachedPollWrapsOnlyReads:
     def test_only_read_only_tools_call_cached_poll(self):
         callers = _functions_containing(lambda n: _is_call_to(n, "_cached_poll"))
@@ -365,9 +350,3 @@ class TestCachedPollWrapsOnlyReads:
                     if _is_call_to(d, "mcp.tool"):
                         arg = next(k.value for k in d.keywords if k.arg == "annotations")
                         assert isinstance(arg, ast.Name) and arg.id == "_READ_ONLY", node.name
-
-
-# ---------------------------------------------------------------------------
-# Trap: the harness itself going stale
-# ---------------------------------------------------------------------------
-
