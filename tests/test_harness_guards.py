@@ -301,6 +301,44 @@ class TestPackageMetadataIsComplete:
         assert len(body) > 1000, len(body)
 
 
+class TestTheSdistShipsOnlyTheReadme:
+    """The working-copy docs are kept out of git via .git/info/exclude, which the
+    build backend does not read. `uv build` shipped AGENTS.md, ARCHITECTURE.md,
+    DESIGN.md, CLAUDE.md, docs/reviews/* and tests/test_docs_guards.py in the
+    sdist (round 1 of 1.10.0, F7). Asking git is not enough; ask the build."""
+
+    @pytest.fixture(scope="class")
+    def sdist_members(self, tmp_path_factory) -> list[str]:
+        import shutil
+        import tarfile
+        if shutil.which("uv") is None:
+            pytest.skip("uv is not on PATH")
+        out = tmp_path_factory.mktemp("sdist")
+        result = subprocess.run(
+            ["uv", "build", "--sdist", "--out-dir", str(out)],
+            cwd=ROOT, capture_output=True, encoding="utf-8", timeout=300,
+        )
+        assert result.returncode == 0, result.stderr
+        archive = next(out.glob("*.tar.gz"))
+        with tarfile.open(archive) as tar:
+            # strip the leading "<name>-<version>/" component
+            return [m.name.split("/", 1)[1] for m in tar.getmembers() if "/" in m.name]
+
+    def test_readme_is_the_only_markdown(self, sdist_members):
+        markdown = sorted(m for m in sdist_members if m.endswith(".md"))
+        assert markdown == ["README.md"], markdown
+
+    def test_the_working_docs_tree_is_absent(self, sdist_members):
+        assert not [m for m in sdist_members if m.startswith("docs/")], sdist_members
+
+    def test_the_local_only_guard_module_is_absent(self, sdist_members):
+        assert "tests/test_docs_guards.py" not in sdist_members
+
+    def test_what_a_build_needs_is_present(self, sdist_members):
+        for required in ("ssh_hpc_server.py", "README.md", "pyproject.toml", "tests/test_policy.py"):
+            assert required in sdist_members, required
+
+
 # ---------------------------------------------------------------------------
 # Trap: the poll limiter must never wrap a mutating tool
 # ---------------------------------------------------------------------------

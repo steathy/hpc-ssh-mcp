@@ -18,6 +18,13 @@ dependencies = [
 sources = ["."]
 include = ["ssh_hpc_server.py"]
 
+# The working-copy documents are kept out of git through .git/info/exclude, which
+# the build backend does not read, so the sdist has to be told explicitly. README.md
+# is the only documentation that ships.
+[tool.hatch.build.targets.sdist]
+only-include = ["ssh_hpc_server.py", "README.md", "pyproject.toml", "tests"]
+exclude = ["tests/test_docs_guards.py"]
+
 [project.scripts]
 hpc-ssh-mcp = "ssh_hpc_server:main"
 
