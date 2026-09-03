@@ -484,11 +484,11 @@ def _store_path() -> str:
     return os.path.expanduser(os.environ.get(STORE_ENV_VAR) or DEFAULT_STORE)
 
 
-def _read_store_file() -> tuple[dict, str | None]:
-    """Return (entries, error). An absent file is not an error; a broken one is.
+def _read_store_document() -> tuple[dict, str | None]:
+    """The store as written: (document, error). An absent file is an empty document.
 
-    Distinguishing the two matters on the write path: rewriting a file we
-    could not read would silently discard whatever it held.
+    Distinguishing absent from broken matters on the write path: rewriting a
+    file we could not read would silently discard whatever it held.
     """
     path = _store_path()
     try:
@@ -502,7 +502,19 @@ def _read_store_file() -> tuple[dict, str | None]:
         return {}, f"Could not parse {path} as JSON: {exc}"
     if not isinstance(raw, dict) or not isinstance(raw.get("hosts", {}), dict):
         return {}, f"Could not use {path}: expected a JSON object with a 'hosts' object."
+    return raw, None
 
+
+def _read_store_file() -> tuple[dict, str | None]:
+    """The hosts the server can use: (entries, error).
+
+    Readers ignore what they cannot use -- an alias outside the pattern, a value
+    that is not a scalar -- and never fail on it. record_host writes the
+    *document* back, not this view of it, so what a reader ignores survives.
+    """
+    raw, error = _read_store_document()
+    if error:
+        return {}, error
     entries: dict = {}
     for host, settings in raw.get("hosts", {}).items():
         if not isinstance(settings, dict) or not _VALID_HOST_RE.match(str(host)):
@@ -522,10 +534,15 @@ def _load_store() -> dict:
     return _read_store_file()[0]
 
 
-def _write_store(entries: dict) -> str | None:
-    """Replace the store atomically and privately. Returns an error, or None."""
+def _write_store(document: dict) -> str | None:
+    """Replace the store atomically and privately. Returns an error, or None.
+
+    The whole document is written: our note first, then whatever else the user
+    put at the top level, then the hosts, sorted.
+    """
     path = _store_path()
-    document = {"_note": _STORE_NOTE, "hosts": dict(sorted(entries.items()))}
+    extra = {k: v for k, v in document.items() if k not in ("_note", "hosts")}
+    document = {"_note": _STORE_NOTE, **extra, "hosts": dict(sorted(document.get("hosts", {}).items()))}
     try:
         directory = os.path.dirname(path) or "."
         os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -2198,7 +2215,7 @@ def record_host(
             pairs["role"] = _ROLE_ALIASES.get(role, role)
 
     with _STATE_LOCK:  # read-merge-write: two concurrent calls lost one host without it
-        entries, read_error = _read_store_file()
+        document, read_error = _read_store_document()
         if read_error:
             return (
                 f"{read_error}\n"
@@ -2213,7 +2230,9 @@ def record_host(
         # system" and revert a recorded hpc=false. An explicit True removes that key
         # (HPC is the default reading); None leaves it alone. Unsetting anything
         # else stays a hand-edit of the file, which _STORE_NOTE invites.
-        existing = entries.get(host, {})
+        hosts = dict(document.get("hosts", {}))
+        existing = hosts.get(host)
+        existing = dict(existing) if isinstance(existing, dict) else {}
         merged = dict(existing)
         merged.update(pairs)
         if is_hpc is True:
@@ -2223,9 +2242,8 @@ def record_host(
                 f"Nothing to write for {host!r}. Pass at least one of is_hpc, center, role, "
                 "account, scratch, globus or policy."
             )
-        entries = dict(entries)
-        entries[host] = merged
-        error = _write_store(entries)
+        hosts[host] = merged
+        error = _write_store({**document, "hosts": hosts})
         if error:
             return error
 

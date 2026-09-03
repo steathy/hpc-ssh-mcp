@@ -467,3 +467,59 @@ class TestSettingsValidationMatchesTheJsonStore:
         ssh_hpc_server.record_host("laptop", is_hpc=False, globus=GLADE)
         assert ssh_hpc_server._is_hpc("laptop") is False
         assert ssh_hpc_server._resolve_collection("laptop") == GLADE
+
+
+# ---------------------------------------------------------------------------
+# F15: record_host rewrites the file it read, not a filtered copy of it
+# ---------------------------------------------------------------------------
+# The reader kept only hosts matching the alias pattern and only scalar values,
+# and record_host wrote that filtered dict back, so hand-written content the
+# readers could not use was dropped without a word -- from a file whose own note
+# says "Safe to edit". The readers still filter; the writer merges into the
+# document as it was.
+
+HAND_WRITTEN = {
+    "_comment": "mine, please keep",
+    "hosts": {
+        "derecho": {"center": "ncar", "scratch": ["/a", "/b"], "note": "a list the server ignores"},
+        "odd:alias": {"center": "curc"},
+        "broken": "not an object",
+    },
+}
+
+
+class TestRecordHostPreservesWhatItDoesNotUnderstand:
+    def _stored(self, store):
+        return json.loads(store.read_text())
+
+    def test_other_hosts_keep_their_hand_written_values(self, store):
+        store.write_text(json.dumps(HAND_WRITTEN))
+        ssh_hpc_server.record_host("casper", account="UABC0001")
+        hosts = self._stored(store)["hosts"]
+        assert hosts["derecho"]["scratch"] == ["/a", "/b"]
+        assert hosts["odd:alias"] == {"center": "curc"}
+        assert hosts["broken"] == "not an object"
+        assert hosts["casper"] == {"account": "UABC0001"}
+
+    def test_top_level_keys_survive(self, store):
+        store.write_text(json.dumps(HAND_WRITTEN))
+        ssh_hpc_server.record_host("casper", account="UABC0001")
+        doc = self._stored(store)
+        assert doc["_comment"] == "mine, please keep"
+        assert "_note" in doc   # ours, still written
+
+    def test_the_recorded_host_keeps_its_own_unknown_values(self, store):
+        store.write_text(json.dumps(HAND_WRITTEN))
+        ssh_hpc_server.record_host("derecho", account="UABC0001")
+        entry = self._stored(store)["hosts"]["derecho"]
+        assert entry["scratch"] == ["/a", "/b"] and entry["account"] == "UABC0001"
+
+    def test_a_host_that_was_not_an_object_becomes_one(self, store):
+        store.write_text(json.dumps(HAND_WRITTEN))
+        ssh_hpc_server.record_host("broken", center="ncar")
+        assert self._stored(store)["hosts"]["broken"] == {"center": "ncar"}
+
+    def test_readers_still_ignore_what_they_cannot_use(self, store):
+        store.write_text(json.dumps(HAND_WRITTEN))
+        assert ssh_hpc_server._host_settings("derecho") == {"center": "ncar", "note": "a list the server ignores"}
+        assert ssh_hpc_server._host_settings("odd:alias") == {}
