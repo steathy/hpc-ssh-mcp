@@ -37,13 +37,13 @@ class TestScpUploadFile:
         from ssh_hpc_server import scp_upload_file
         result = scp_upload_file(
             host="derecho",
-            local_path="C:/Users/me/input.nc",
+            local_path="/data/me/input.nc",
             remote_path="/scratch/user/input.nc",
         )
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "scp"
         # local source and remote dest are always the last two argv elements
-        assert cmd[-2] == "C:/Users/me/input.nc"
+        assert cmd[-2] == "/data/me/input.nc"
         assert "derecho:" in cmd[-1]
 
     def test_reports_upload_failure(self, mock_subprocess):

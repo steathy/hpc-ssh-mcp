@@ -118,3 +118,135 @@ class TestTimeoutValidation:
     def test_scp_download_rejects_non_positive_timeout(self, bad):
         with pytest.raises(ValueError, match="timeout"):
             scp_download_file(host="derecho", remote_path="/r/x", local_path="/tmp/x", timeout=bad)
+
+
+# ---------------------------------------------------------------------------
+# Finding 7: local_path must survive scp's host:path parsing and option parsing
+# ---------------------------------------------------------------------------
+
+class TestLocalPathSafety:
+    def test_colon_in_local_download_path_is_not_a_host(self, mock_subprocess, tmp_path):
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        target = str(tmp_path / "data:2024.nc")
+        scp_download_file(host="derecho", remote_path="/r/x.nc", local_path=target)
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[-1] == target
+        assert cmd[-1].startswith("/")
+
+    def test_relative_local_path_becomes_absolute(self, mock_subprocess):
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        scp_download_file(host="derecho", remote_path="/r/x.nc", local_path="out:1.nc")
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[-1].startswith("/")
+        assert cmd[-1].endswith("/out:1.nc")
+
+    def test_dash_prefixed_local_upload_path_is_not_an_option(self, mock_subprocess):
+        from ssh_hpc_server import scp_upload_file
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        scp_upload_file(host="derecho", local_path="-oProxyCommand=evil", remote_path="/r/x")
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[-2].startswith("/")
+        assert cmd[-2].endswith("/-oProxyCommand=evil")
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: remote path quoting must match the scp protocol in use
+# ---------------------------------------------------------------------------
+
+class TestOpenSshVersionParsing:
+    @pytest.mark.parametrize("banner,expected", [
+        ("OpenSSH_10.2p1 Ubuntu-2ubuntu3.5, OpenSSL 3.5.5 27 Jan 2026", (10, 2)),
+        ("OpenSSH_8.9p1 Ubuntu-3ubuntu0.10, OpenSSL 3.0.2 15 Mar 2022", (8, 9)),
+        ("OpenSSH_9.0p1, LibreSSL 3.3.6", (9, 0)),
+        ("not an ssh banner", None),
+        ("", None),
+    ])
+    def test_parses_major_minor(self, banner, expected):
+        from ssh_hpc_server import _parse_openssh_version
+        assert _parse_openssh_version(banner) == expected
+
+    def test_real_local_ssh_reports_a_version(self):
+        """No mock: the installed ssh must be detectable, or scp mode is a guess."""
+        from ssh_hpc_server import _local_openssh_version
+        ver = _local_openssh_version()
+        assert isinstance(ver, tuple) and len(ver) == 2
+        assert ver >= (1, 0)
+
+
+class TestScpRemotePathMode:
+    SPACED = "/glade/scratch/u/my file.nc"
+
+    def test_sftp_mode_passes_path_unquoted(self, mock_subprocess, monkeypatch):
+        monkeypatch.setattr(ssh_hpc_server, "_SCP_SFTP_MODE", True)
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        scp_download_file(host="derecho", remote_path=self.SPACED, local_path="/tmp/x")
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[-2] == f"derecho:{self.SPACED}"
+
+    def test_legacy_mode_quotes_path_for_remote_shell(self, mock_subprocess, monkeypatch):
+        monkeypatch.setattr(ssh_hpc_server, "_SCP_SFTP_MODE", False)
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        scp_download_file(host="derecho", remote_path=self.SPACED, local_path="/tmp/x")
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[-2] == f"derecho:'{self.SPACED}'"
+
+    def test_sftp_mode_tilde_becomes_home_relative(self, mock_subprocess, monkeypatch):
+        """SFTP resolves relative paths against $HOME, and never expands '~'."""
+        monkeypatch.setattr(ssh_hpc_server, "_SCP_SFTP_MODE", True)
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        scp_download_file(host="derecho", remote_path="~/run 1/out.nc", local_path="/tmp/x")
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[-2] == "derecho:run 1/out.nc"
+
+    def test_legacy_mode_tilde_becomes_dollar_home(self, mock_subprocess, monkeypatch):
+        monkeypatch.setattr(ssh_hpc_server, "_SCP_SFTP_MODE", False)
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        from ssh_hpc_server import scp_upload_file
+        scp_upload_file(host="derecho", local_path="/tmp/x", remote_path="~/run 1/out.nc")
+        cmd = mock_subprocess.call_args[0][0]
+        assert cmd[-1] == "derecho:\"$HOME\"/'run 1/out.nc'"
+
+    def test_mode_is_detected_from_local_ssh_version(self, mock_subprocess, monkeypatch):
+        """With the version probe answering 10.2, SFTP mode must be chosen."""
+        monkeypatch.setattr(ssh_hpc_server, "_SCP_SFTP_MODE", None)
+        monkeypatch.setattr(ssh_hpc_server, "_local_openssh_version", lambda: (10, 2))
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        scp_download_file(host="derecho", remote_path=self.SPACED, local_path="/tmp/x")
+        assert mock_subprocess.call_args[0][0][-2] == f"derecho:{self.SPACED}"
+
+    def test_unknown_version_falls_back_to_quoting(self, mock_subprocess, monkeypatch):
+        """Quoting is the safe failure: it breaks odd paths but never reaches a shell unquoted."""
+        monkeypatch.setattr(ssh_hpc_server, "_SCP_SFTP_MODE", None)
+        monkeypatch.setattr(ssh_hpc_server, "_local_openssh_version", lambda: None)
+        mock_subprocess.return_value = make_completed_process(returncode=0)
+        scp_download_file(host="derecho", remote_path=self.SPACED, local_path="/tmp/x")
+        assert mock_subprocess.call_args[0][0][-2] == f"derecho:'{self.SPACED}'"
+
+
+# ---------------------------------------------------------------------------
+# Finding 9: a timed-out download must not leave a truncated file behind
+# ---------------------------------------------------------------------------
+
+class TestScpTimeoutCleanup:
+    def _timeout_after_writing(self, path, content=b"partial"):
+        def side_effect(cmd, **kwargs):
+            with open(path, "wb") as fh:
+                fh.write(content)
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 1))
+        return side_effect
+
+    def test_partial_file_removed_when_it_did_not_exist_before(self, mock_subprocess, tmp_path):
+        target = tmp_path / "big.nc"
+        mock_subprocess.side_effect = self._timeout_after_writing(target)
+        result = scp_download_file(host="derecho", remote_path="/r/big.nc", local_path=str(target), timeout=5)
+        assert "Timed out" in result
+        assert not target.exists()
+        assert "removed" in result.lower()
+
+    def test_preexisting_file_is_left_alone(self, mock_subprocess, tmp_path):
+        target = tmp_path / "keep.nc"
+        target.write_bytes(b"original")
+        mock_subprocess.side_effect = self._timeout_after_writing(target, b"clobbered")
+        result = scp_download_file(host="derecho", remote_path="/r/keep.nc", local_path=str(target), timeout=5)
+        assert "Timed out" in result
+        assert target.exists()

@@ -185,13 +185,13 @@ class TestScpDownloadFile:
         result = scp_download_file(
             host="derecho",
             remote_path="/data/output.nc",
-            local_path="C:/Users/me/output.nc",
+            local_path="/data/me/output.nc",
         )
         cmd = mock_subprocess.call_args[0][0]
         assert cmd[0] == "scp"
         # source (remote) and dest (local) are always the last two argv elements
         assert "derecho:" in cmd[-2]
-        assert cmd[-1] == "C:/Users/me/output.nc"
+        assert cmd[-1] == "/data/me/output.nc"
 
     def test_reports_scp_failure(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(

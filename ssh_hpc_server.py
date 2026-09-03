@@ -7,6 +7,7 @@ and ControlMaster multiplex sockets (avoiding MFA re-prompts).
 Run with:  uv run ssh_hpc_server.py
 """
 
+import os
 import re
 import shlex
 import subprocess
@@ -39,6 +40,13 @@ SSH_OPTS: tuple[str, ...] = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 _VALID_HOST_RE = re.compile(r"^[a-zA-Z0-9._@-]+$")
 _VALID_JOB_ID_RE = re.compile(r"^\d+([_.]\d+)*$")
 _VALID_USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_OPENSSH_VERSION_RE = re.compile(r"OpenSSH_(\d+)\.(\d+)")
+
+# scp protocol mode of the *local* scp binary, resolved lazily from `ssh -V`.
+# OpenSSH >= 9.0 speaks SFTP by default: the remote path is sent literally
+# (no remote shell), so it must NOT be shell-quoted. Older scp runs a remote
+# shell, so the path MUST be quoted. None = not yet probed.
+_SCP_SFTP_MODE: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +66,73 @@ def _validate_host(host: str) -> None:
 def _validate_timeout(timeout: int) -> None:
     if timeout is None or timeout < 1:
         raise ValueError(f"timeout must be a positive number of seconds, got {timeout!r}")
+
+
+def _shell_path(path: str) -> str:
+    """Quote a remote path for interpolation into a remote shell command.
+
+    shlex.quote would turn a leading '~' into a literal, so home-relative
+    paths are rewritten to "$HOME"/<quoted rest> outside the quotes.
+    """
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        rest = path[2:]
+        return '"$HOME"' if not rest else f'"$HOME"/{shlex.quote(rest)}'
+    return shlex.quote(path)
+
+
+def _local_path(path: str) -> str:
+    """Normalise a local path for scp's argv.
+
+    An absolute path starts with '/', which defeats both scp's host:path
+    parsing (a ':' before the first '/') and option parsing (a leading '-').
+    """
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _parse_openssh_version(banner: str) -> tuple[int, int] | None:
+    m = _OPENSSH_VERSION_RE.search(banner or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _local_openssh_version() -> tuple[int, int] | None:
+    """Return (major, minor) of the local OpenSSH client, or None if unknown."""
+    try:
+        result = subprocess.run(
+            ["ssh", "-V"], capture_output=True, encoding="utf-8", errors="replace",
+            timeout=10, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # OpenSSH prints its banner on stderr; some builds use stdout.
+    return _parse_openssh_version(result.stderr) or _parse_openssh_version(result.stdout)
+
+
+def _scp_uses_sftp() -> bool:
+    """True when the local scp defaults to the SFTP protocol (OpenSSH >= 9.0).
+
+    Unknown versions are treated as legacy: quoting a path that did not need
+    it breaks odd filenames, but leaving a path unquoted for a remote shell
+    would be an injection hole.
+    """
+    global _SCP_SFTP_MODE
+    if _SCP_SFTP_MODE is None:
+        ver = _local_openssh_version()
+        _SCP_SFTP_MODE = ver is not None and ver >= (9, 0)
+    return _SCP_SFTP_MODE
+
+
+def _scp_remote_spec(host: str, path: str) -> str:
+    """Build scp's host:path argument for the protocol mode in use."""
+    if _scp_uses_sftp():
+        # SFTP resolves relative paths against $HOME and never expands '~'.
+        if path == "~":
+            path = "."
+        elif path.startswith("~/"):
+            path = path[2:] or "."
+        return f"{host}:{path}"
+    return f"{host}:{_shell_path(path)}"
 
 
 def _run_raw(
@@ -184,8 +259,8 @@ def _run_ssh_raw(
     return _run_raw(_ssh_cmd(host, remote_cmd), timeout=timeout, input_data=input_data)
 
 
-def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT) -> str:
-    """Run scp and append a diagnostic hint on failure (host used only for the hint).
+def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT) -> tuple[int, str]:
+    """Run scp; return (rc, formatted output with a diagnostic hint on failure).
 
     scp propagates ssh's 255 when the connection itself fails, so the same
     gate applies.
@@ -194,7 +269,7 @@ def _run_scp(host: str, scp_args: list[str], timeout: int = DEFAULT_SCP_TIMEOUT)
     formatted = _format_result(rc, out, err)
     if rc == SSH_OWN_FAILURE_RC:
         formatted += _diagnose_ssh_failure(host, err)
-    return formatted
+    return rc, formatted
 
 
 # ---------------------------------------------------------------------------
@@ -403,9 +478,14 @@ def scp_download_file(
     """
     _validate_host(host)
     _validate_timeout(timeout)
-    # shlex.quote the remote path for the remote shell that scp invokes
-    escaped_remote = shlex.quote(remote_path)
-    return _run_scp(host, [f"{host}:{escaped_remote}", local_path], timeout=timeout)
+    local_abs = _local_path(local_path)
+    existed_before = os.path.exists(local_abs)
+    rc, result = _run_scp(host, [_scp_remote_spec(host, remote_path), local_abs], timeout=timeout)
+    if rc == -1 and not existed_before and os.path.isfile(local_abs):
+        # A timed-out scp leaves a silently truncated destination behind.
+        os.remove(local_abs)
+        result += f"\nPartial download removed: {local_abs}"
+    return result
 
 
 @mcp.tool()
@@ -427,8 +507,10 @@ def scp_upload_file(
     """
     _validate_host(host)
     _validate_timeout(timeout)
-    escaped_remote = shlex.quote(remote_path)
-    return _run_scp(host, [local_path, f"{host}:{escaped_remote}"], timeout=timeout)
+    _, result = _run_scp(
+        host, [_local_path(local_path), _scp_remote_spec(host, remote_path)], timeout=timeout,
+    )
+    return result
 
 
 @mcp.tool()
