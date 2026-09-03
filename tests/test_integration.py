@@ -141,6 +141,18 @@ class TestLivePolicy:
         _ok(execute_remote_bash(HOST, f"rm -rf '{victim}'", confirm_destructive=True))
         assert "No such file" in execute_remote_bash(HOST, f"ls '{victim}'")
 
+    def test_shared_root_traversal_never_reaches_the_host(self, remote_dir):
+        """NSF NCAR: a traversal at a shared root is a metadata storm. Blocked locally."""
+        marker = f"{remote_dir}/traversal-ran"
+        out = execute_remote_bash(HOST, f"find /glade -name x > '{marker}'")
+        assert "Blocked" in out
+        assert "metadata" in out.lower()
+        assert "No such file" in execute_remote_bash(HOST, f"ls '{marker}'")
+
+    def test_traversal_inside_your_own_directory_is_allowed(self, remote_dir):
+        out = _ok(execute_remote_bash(HOST, f"find '{remote_dir}' -maxdepth 1 -type d"))
+        assert remote_dir in out
+
     def test_route_tier_runs_only_with_the_flag(self, remote_dir):
         script = f"{remote_dir}/hello.py"
         _ok(execute_remote_bash(HOST, f"printf 'print(1)\\n' > '{script}'"))

@@ -41,3 +41,20 @@ role = "workstation"
 glade    = "00000000-0000-0000-0000-000000000000"  # NCAR GLADE
 campaign = "00000000-0000-0000-0000-000000000000"  # NCAR Campaign Storage
 alpine   = "00000000-0000-0000-0000-000000000000"  # CU Boulder Research Computing
+
+# The policy escape hatch. Only a human can set this: no tool takes a policy
+# argument, so an agent can never switch off its own guard rails.
+#
+#   strict     (default) the block tier is enforced with no override
+#   permissive the block tier becomes a confirmation the agent must ask for
+#   off        no policy checks at all
+#
+# For one session instead of permanently, launch the server with
+# HPC_SSH_MCP_POLICY=permissive (or =off).
+[policy]
+mode = "strict"
+
+# Per-host override, e.g. on a machine you own and administer yourself:
+#   [my-workstation]
+#   role   = "workstation"
+#   policy = "off"

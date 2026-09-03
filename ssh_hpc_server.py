@@ -395,6 +395,44 @@ def _host_role(host: str) -> str:
     return role if role in VALID_ROLES else "login"
 
 
+# The policy escape belongs to the human, not to the model. A tier exists to
+# stop the agent doing something the user did not intend, so a tool parameter
+# that switches it off would defeat it. These come from the config file the
+# user edits, or the environment the server was launched with.
+POLICY_MODES = ("strict", "permissive", "off")
+POLICY_ENV_VAR = "HPC_SSH_MCP_POLICY"
+
+
+def _policy_mode(host: str) -> str:
+    """'strict' (default), 'permissive' (block needs confirmation) or 'off'.
+
+    Resolution order: environment variable, per-host `policy`, global
+    [policy] mode, then strict.
+    """
+    for candidate in (
+        os.environ.get(POLICY_ENV_VAR, ""),
+        _host_profile(host).get("policy", ""),
+        _load_profiles().get("policy", {}).get("mode", ""),
+    ):
+        value = str(candidate).strip().lower()
+        if value in POLICY_MODES:
+            return value
+        if value:
+            return "strict"  # a typo must not silently weaken the guard
+    return "strict"
+
+
+_RELAX_INSTRUCTIONS = (
+    "\n\nIf this is deliberate and you accept the risk, it is the user's call to make, "
+    "not this server's, and not yours. They can relax the guard for a host in "
+    "hosts.toml:\n"
+    '    [<host>]\n    policy = "permissive"   # block tier becomes a confirmation\n'
+    '    policy = "off"          # no checks at all\n'
+    f"or for one session by launching the server with {POLICY_ENV_VAR}=permissive "
+    f"(or {POLICY_ENV_VAR}=off). Ask them to do that; you cannot set it yourself."
+)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler-poll rate limiting
 # ---------------------------------------------------------------------------
@@ -477,6 +515,11 @@ _SEGMENT_RULES = (
     (re.compile(r"^find\b.*(?:-delete\b|-exec\s+rm\b)"), "confirm", "find ... -delete / -exec rm", None),
     (re.compile(r"^ch(?:mod|own|grp)\b.*(?:\s-[a-zA-Z]*R\b|--recursive)"), "confirm",
      "recursive chmod/chown", None),
+    (re.compile(r"^chmod\b.*(?:\s(?:777|666|0777|0666)\b|\s[ao][+=][rwx]*w[rwx]*\b)"), "confirm",
+     "world-writable permissions (NSF NCAR: never chmod 777)", None),
+    (re.compile(r"^tail\b.*\s-[a-zA-Z]*[fF]\b"), "route",
+     "tail -f: a polling loop that holds a login node", _LOGIN_ROLES),
+    (re.compile(r"^watch\b"), "route", "watch: a polling loop", _LOGIN_ROLES),
     (re.compile(r"^git\s+push\b.*(?:--force(?:-with-lease)?\b|\s-f\b)"), "confirm", "git push --force", None),
     (re.compile(r"^git\s+reset\b.*--hard\b"), "confirm", "git reset --hard", None),
     (re.compile(r"^git\s+clean\b.*\s-[a-zA-Z]*[fd]"), "confirm", "git clean -fd", None),
@@ -508,6 +551,85 @@ _SEGMENT_RULES = (
     (re.compile(r"^(?:rsync|scp|sftp)\b"), "route", "bulk transfer", _COMPUTE_ROLES),
     (re.compile(r"^cp\b.*\s-[a-zA-Z]*[rRa]"), "route", "recursive copy", _COMPUTE_ROLES),
 )
+
+# Recursive traversal at or above one of these degrades the shared parallel
+# filesystem for every user on the machine. NSF NCAR's agentic-AI guidance
+# names them explicitly and says NEVER.
+SHARED_ROOTS = frozenset({
+    "/", "/glade", "/glade/u", "/glade/u/home", "/glade/work", "/glade/campaign",
+    "/glade/derecho", "/glade/derecho/scratch", "/glade/scratch",
+    "/scratch", "/scratch/alpine", "/projects", "/pl", "/pl/active",
+    "/home", "/work", "/data",
+})
+_TRAVERSAL_RE = re.compile(
+    r"^(?:lfs\s+find|find|du|ncdu|tree|ls|grep|egrep|fgrep|rg|ripgrep|locate)\b(?P<rest>.*)$", re.S,
+)
+# For these, the first non-flag token is a pattern, not a path.
+_PATTERN_FIRST = ("grep", "egrep", "fgrep", "rg", "ripgrep")
+# ls and grep only walk the tree when asked to recurse.
+_NEEDS_RECURSIVE_FLAG = ("ls", "grep", "egrep", "fgrep")
+
+
+def _traversal_tier(segment: str) -> tuple[str, str] | None:
+    """Block find/du/ls -R/grep -r/rg at or above a shared filesystem root."""
+    m = _TRAVERSAL_RE.match(segment)
+    if not m:
+        return None
+    tokens = segment.split()
+    name = "lfs find" if tokens[0] == "lfs" else tokens[0]
+    args = tokens[2:] if name == "lfs find" else tokens[1:]
+
+    if name in _NEEDS_RECURSIVE_FLAG:
+        recursive = any(
+            tok.startswith("-") and not tok.startswith("--") and re.search(r"[rR]", tok)
+            for tok in args
+        ) or "--recursive" in args
+        if not recursive:
+            return None
+
+    paths, seen_pattern = [], False
+    for tok in args:
+        if tok.startswith("-"):
+            # find's predicates (-name, -type, ...) mark the end of its paths.
+            if name in ("find", "lfs find"):
+                break
+            continue
+        if name in _PATTERN_FIRST and not seen_pattern:
+            seen_pattern = True
+            continue
+        paths.append(tok)
+
+    for path in paths:
+        clean = path.strip("\"'")
+        if not clean.startswith("/"):
+            continue
+        normalised = "/" + clean.strip("/") if clean.strip("/") else "/"
+        if normalised in SHARED_ROOTS:
+            return (
+                "block",
+                f"recursive traversal at or above the shared root {normalised} "
+                f"({name}): this causes a filesystem metadata storm for every user. "
+                "Point it at your own subdirectory instead.",
+            )
+    return None
+
+
+_MAKE_RE = re.compile(r"^(?:make|gmake|ninja|cmake)\b(?P<rest>.*)$", re.S)
+
+
+def _unbounded_parallelism_tier(segment: str) -> tuple[str, str] | None:
+    """`make -j` with no limit spawns one job per core on a shared login node."""
+    if not _MAKE_RE.match(segment):
+        return None
+    tokens = segment.split()
+    for i, tok in enumerate(tokens):
+        if tok == "-j":
+            following = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if not following.isdigit():
+                return ("confirm", "unbounded build parallelism (`make -j`); NSF NCAR asks for a "
+                                   "small fixed -j, for example -j4")
+    return None
+
 
 _SEGMENT_SPLIT_RE = re.compile(r"(?:\r?\n|;|\|\||&&|\||&)+")
 _ENV_PREFIX_RE = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
@@ -603,6 +725,8 @@ def _tar_tier(segment: str) -> tuple[str, str] | None:
 
 _CALLABLE_RULES = (
     (_rm_tier, None),
+    (_traversal_tier, _LOGIN_ROLES),
+    (_unbounded_parallelism_tier, _LOGIN_ROLES),
     (_interpreter_tier, _LOGIN_ROLES),
     (_compiler_tier, _LOGIN_ROLES),
     (_tar_tier, _COMPUTE_ROLES),
@@ -642,15 +766,22 @@ def _policy_refusal(
     role: str,
     confirm_destructive: bool,
     allow_on_login_node: bool,
+    mode: str = "strict",
 ) -> str | None:
     """Return a refusal message if policy stops this command, else None."""
+    if mode == "off":
+        return None
     tier, rule = _classify_command(command, role)
     if tier == "block":
-        return (
-            f"Blocked by policy: {rule}.\n"
-            "This tool will not run that command on a shared HPC system, and there is no "
-            "override. If you genuinely need it, run it yourself from your own terminal."
-        )
+        if mode != "permissive":
+            return f"Blocked by policy: {rule}.{_RELAX_INSTRUCTIONS}"
+        if not confirm_destructive:
+            return (
+                f"Refused pending confirmation: {rule}.\n"
+                "This host's policy is 'permissive', so the user can authorise it. Ask them "
+                "to confirm, then call again with confirm_destructive=true."
+            )
+        return None
     if tier == "confirm" and not confirm_destructive:
         return (
             f"Refused pending confirmation: {rule}.\n"
@@ -704,6 +835,7 @@ def execute_remote_bash(
     _validate_timeout(timeout)
     refusal = _policy_refusal(
         command, _host_role(host), confirm_destructive, allow_on_login_node,
+        mode=_policy_mode(host),
     )
     if refusal:
         return refusal
@@ -968,7 +1100,8 @@ def run_on_compute(
     _validate_timeout(timeout)
     # role='compute': this command runs on a compute node by construction, so the
     # login-node routing rules do not apply, but block/confirm still do.
-    refusal = _policy_refusal(command, "compute", confirm_destructive, True)
+    refusal = _policy_refusal(command, "compute", confirm_destructive, True,
+                              mode=_policy_mode(host))
     if refusal:
         return refusal
     _validate_directive("account", account)
