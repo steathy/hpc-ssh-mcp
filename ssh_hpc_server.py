@@ -44,7 +44,10 @@ SSH_OWN_FAILURE_RC = 255
 SSH_OPTS: tuple[str, ...] = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 
 _VALID_HOST_RE = re.compile(r"^[a-zA-Z0-9._@-]+$")
-_VALID_JOB_ID_RE = re.compile(r"^\d+([_.]\d+)*$")
+_VALID_SLURM_JOB_ID_RE = re.compile(r"^\d+([_.]\d+)*$")
+_VALID_PBS_JOB_ID_RE = re.compile(r"^\d+(\[\d*\])?(\.[A-Za-z0-9.-]+)?$")
+_VALID_DIRECTIVE_RE = re.compile(r"^[A-Za-z0-9_.:=,+-]+$")  # account, queue, -l select strings
+_VALID_WALLTIME_RE = re.compile(r"^\d{1,3}:\d{2}:\d{2}$")
 _VALID_USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _OPENSSH_VERSION_RE = re.compile(r"OpenSSH_(\d+)\.(\d+)")
 
@@ -333,32 +336,123 @@ def execute_remote_bash(
     return _run_ssh_script(host, command, timeout=timeout)
 
 
+# ---------------------------------------------------------------------------
+# Scheduler-aware job tools (PBS Pro on NCAR Derecho/Casper, Slurm on CURC Alpine)
+# ---------------------------------------------------------------------------
+
+SCHEDULERS = ("pbs", "slurm")
+DEFAULT_COMPUTE_TIMEOUT = 1800
+_SQUEUE_FORMAT = "%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R"
+
+# alias -> "pbs" | "slurm", filled by _detect_scheduler. A host does not change
+# its scheduler mid-session; probing once keeps login-node load negligible.
+_SCHEDULER_CACHE: dict[str, str] = {}
+
+
+def _detect_scheduler(host: str) -> str:
+    """Return 'pbs' or 'slurm' for host, probing once for qsub / sbatch."""
+    if host in _SCHEDULER_CACHE:
+        return _SCHEDULER_CACHE[host]
+    script = 'for s in qsub sbatch; do command -v "$s" >/dev/null 2>&1 && echo "$s"; done; true'
+    rc, out, err = _run_ssh_script_raw(host, script)
+    if rc != 0:
+        msg = f"Could not probe the scheduler on {host!r}:\n{_format_result(rc, out, err)}"
+        if rc == SSH_OWN_FAILURE_RC:
+            msg += _diagnose_ssh_failure(host, err)
+        raise ValueError(msg)
+    found = set(out.split())
+    has_pbs, has_slurm = "qsub" in found, "sbatch" in found
+    if has_pbs and has_slurm:
+        raise ValueError(
+            f"Both qsub and sbatch exist on {host!r}; pass scheduler='pbs' or scheduler='slurm'."
+        )
+    if has_pbs:
+        sched = "pbs"
+    elif has_slurm:
+        sched = "slurm"
+    else:
+        raise ValueError(
+            f"No PBS or Slurm scheduler commands found on {host!r} (looked for qsub and sbatch). "
+            "Is this a login node of an HPC system?"
+        )
+    _SCHEDULER_CACHE[host] = sched
+    return sched
+
+
+def _resolve_scheduler(host: str, scheduler: str) -> str:
+    if scheduler == "auto":
+        return _detect_scheduler(host)
+    if scheduler not in SCHEDULERS:
+        raise ValueError(f"scheduler must be 'auto', 'pbs' or 'slurm', got {scheduler!r}")
+    return scheduler
+
+
+def _validate_job_id(job_id: str, scheduler: str) -> str:
+    """Validate a job ID for the scheduler and return it shell-quoted."""
+    if scheduler == "pbs":
+        ok = _VALID_PBS_JOB_ID_RE.match(job_id or "")
+        label, expected = "PBS", "e.g. '2426690', '2426690.desched1' or '123[].desched1'"
+    else:
+        ok = _VALID_SLURM_JOB_ID_RE.match(job_id or "")
+        label, expected = "Slurm", "e.g. '12345', '12345_0' (array) or '12345.0' (step)"
+    if not ok:
+        raise ValueError(f"Invalid {label} job ID: {job_id!r}. Expected {expected}.")
+    return shlex.quote(job_id)
+
+
+def _validate_directive(name: str, value: str, pattern: re.Pattern = None) -> None:
+    """Reject scheduler directive values that could carry shell syntax."""
+    if value and not (pattern or _VALID_DIRECTIVE_RE).match(value):
+        raise ValueError(f"Invalid {name}: {value!r}")
+
+
 @mcp.tool()
-def submit_slurm_job(
+def submit_job(
     host: str,
     job_script_content: str,
     remote_filename: str = "",
+    remote_dir: str = "",
+    scheduler: str = "auto",
 ) -> str:
-    """Write a Slurm batch script to a remote host and submit it with sbatch.
+    """Write a batch script to a remote host and submit it (qsub on PBS, sbatch on Slurm).
 
-    The script content is piped via stdin to avoid shell-escaping issues.
-    Returns the sbatch output (typically 'Submitted batch job <ID>').
+    The script content is piped via stdin, so #PBS / #SBATCH directives and
+    quoting survive intact. Returns the scheduler's output: a PBS job ID such
+    as '2426690.desched1', or 'Submitted batch job <ID>' on Slurm.
+
+    NCAR Derecho and Casper are PBS Pro (scripts need '#PBS -A <project>');
+    CU Boulder Alpine is Slurm. Submit from a scratch or work directory via
+    remote_dir (for example /glade/derecho/scratch/<user>/run1 or
+    /scratch/alpine/<user>/run1) rather than from $HOME.
 
     Args:
         host: SSH config alias for the HPC system.
-        job_script_content: Full text of the Slurm batch script (including #SBATCH directives).
-        remote_filename: Where to write the script on the remote host. Auto-generated if empty.
+        job_script_content: Full text of the batch script, including directives.
+        remote_filename: Script name on the remote host. Auto-generated if empty.
+        remote_dir: Directory to write to and submit from (created if missing).
+            Defaults to the SSH login directory, usually $HOME.
+        scheduler: 'auto' (detect once per host), 'pbs' or 'slurm'.
     """
     _validate_host(host)
+    sched = _resolve_scheduler(host, scheduler)
     if not remote_filename:
         remote_filename = f"claude_job_{uuid.uuid4().hex[:8]}.sh"
-    if remote_filename.startswith("-"):
-        raise ValueError(f"remote_filename must not start with '-': {remote_filename!r}")
-    safe_fn = shlex.quote(remote_filename)
+    for name, value in (("remote_filename", remote_filename), ("remote_dir", remote_dir)):
+        if value.startswith("-"):
+            raise ValueError(f"{name} must not start with '-': {value!r}")
+    safe_fn = _shell_path(remote_filename)
+    enter = write_prefix = ""
+    if remote_dir:
+        safe_dir = _shell_path(remote_dir)
+        enter = f"cd {safe_dir} && "
+        write_prefix = f"mkdir -p {safe_dir} && {enter}"
 
+    # The script body occupies stdin here, so this one line is interpolated
+    # into the ssh command. It is a single line with no '!' and only plain
+    # redirection, which every login shell parses the same way.
     rc, out, err = _run_ssh_raw(
         host,
-        f"cat > {safe_fn} && chmod -- +x {safe_fn}",
+        f"{write_prefix}cat > {safe_fn} && chmod -- +x {safe_fn}",
         input_data=job_script_content,
     )
     if rc != 0:
@@ -367,81 +461,154 @@ def submit_slurm_job(
             msg += _diagnose_ssh_failure(host, err)
         return msg
 
-    return _run_ssh(host, f"sbatch -- {safe_fn}")
+    submit = f"qsub {safe_fn}" if sched == "pbs" else f"sbatch -- {safe_fn}"
+    return _run_ssh_script(host, enter + submit)
 
 
 @mcp.tool()
-def check_slurm_job(host: str, job_id: str) -> str:
-    """Check the status of a Slurm job.
+def check_job(host: str, job_id: str, scheduler: str = "auto") -> str:
+    """Check the status of a batch job, including one that has already finished.
 
-    Queries both squeue (running/pending) and sacct (accounting/completed)
-    to give a complete picture regardless of job state.
+    PBS: 'qstat -x' (history included) plus the key fields of 'qstat -x -f'
+    (state, queue, exit status, comment, resources used, output paths).
+    Slurm: squeue for running/pending plus sacct for accounting. One round
+    trip either way.
 
     Args:
         host: SSH config alias for the HPC system.
-        job_id: Slurm job ID (e.g. '12345', '12345_0' for array jobs).
+        job_id: PBS ID like '2426690' or '2426690.desched1' (array '123[].desched1');
+            Slurm ID like '12345', '12345_0' (array) or '12345.0' (step).
+        scheduler: 'auto' (detect once per host), 'pbs' or 'slurm'.
     """
     _validate_host(host)
-    if not _VALID_JOB_ID_RE.match(job_id):
-        raise ValueError(
-            f"Invalid Slurm job ID: {job_id!r}. "
-            "Expected numeric ID, optionally with _ or . separators for array/step jobs."
+    sched = _resolve_scheduler(host, scheduler)
+    sid = _validate_job_id(job_id, sched)
+    if sched == "pbs":
+        script = (
+            f"qstat -x -w {sid} 2>&1 || true\n"
+            "echo\n"
+            f"qstat -x -f {sid} 2>/dev/null | grep -E "
+            "'^ *(job_state|queue|Exit_status|comment|stime|obittime|"
+            "resources_used\\.(walltime|ncpus|mem)|Output_Path|Error_Path) =' || true\n"
         )
-
-    safe_id = shlex.quote(job_id)
-
-    squeue_result = _run_ssh(
-        host,
-        f"squeue -j {safe_id} --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R' 2>/dev/null",
-    )
-    sacct_result = _run_ssh(
-        host,
-        f"sacct -j {safe_id} --format=JobID,JobName,Partition,State,ExitCode,Elapsed,Start,End --parsable2",
-    )
-
-    return (
-        f"=== squeue (running/pending) ===\n{squeue_result}\n\n"
-        f"=== sacct (accounting) ===\n{sacct_result}"
-    )
+    else:
+        script = (
+            "echo '=== squeue (running/pending) ==='\n"
+            f"squeue -j {sid} --format='{_SQUEUE_FORMAT}' 2>/dev/null "
+            "|| echo '(not in queue: finished or unknown; see sacct below)'\n"
+            "echo\n"
+            "echo '=== sacct (accounting) ==='\n"
+            f"sacct -j {sid} --format=JobID,JobName,Partition,State,ExitCode,Elapsed,Start,End --parsable2\n"
+        )
+    return _run_ssh_script(host, script)
 
 
 @mcp.tool()
-def list_slurm_queue(host: str, user: str = "") -> str:
-    """List Slurm jobs in the queue for a user.
+def list_queue(host: str, user: str = "", scheduler: str = "auto") -> str:
+    """List batch jobs in the queue for a user (qstat on PBS, squeue on Slurm).
 
-    Defaults to the current user ($USER) if no user is specified.
+    Defaults to the remote $USER. Poll sparingly: HPC centers flag agents
+    that hammer the scheduler; once every 30 s or more is plenty.
 
     Args:
         host: SSH config alias for the HPC system.
         user: Username to filter by. Defaults to the remote $USER.
+        scheduler: 'auto' (detect once per host), 'pbs' or 'slurm'.
     """
     _validate_host(host)
+    sched = _resolve_scheduler(host, scheduler)
     if user:
         if not _VALID_USERNAME_RE.match(user):
             raise ValueError(f"Invalid username: {user!r}")
-        safe_user = shlex.quote(user)
-        cmd = f"squeue -u {safe_user} --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R'"
+        who = shlex.quote(user)
     else:
-        cmd = "squeue -u $USER --format='%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R'"
-    return _run_ssh(host, cmd)
+        who = '"$USER"'
+    if sched == "pbs":
+        script = f"qstat -w -u {who}"
+    else:
+        script = f"squeue -u {who} --format='{_SQUEUE_FORMAT}'"
+    return _run_ssh_script(host, script)
 
 
 @mcp.tool()
-def cancel_slurm_job(host: str, job_id: str) -> str:
-    """Cancel a Slurm job by its job ID.
+def cancel_job(host: str, job_id: str, scheduler: str = "auto") -> str:
+    """Cancel a batch job by ID (qdel on PBS, scancel on Slurm).
 
     Args:
         host: SSH config alias for the HPC system.
-        job_id: Slurm job ID to cancel (e.g. '12345', '12345_0' for array jobs).
+        job_id: The job ID to cancel, in the scheduler's own format.
+        scheduler: 'auto' (detect once per host), 'pbs' or 'slurm'.
     """
     _validate_host(host)
-    if not _VALID_JOB_ID_RE.match(job_id):
-        raise ValueError(
-            f"Invalid Slurm job ID: {job_id!r}. "
-            "Expected numeric ID, optionally with _ or . separators for array/step jobs."
-        )
-    safe_id = shlex.quote(job_id)
-    return _run_ssh(host, f"scancel {safe_id}")
+    sched = _resolve_scheduler(host, scheduler)
+    sid = _validate_job_id(job_id, sched)
+    return _run_ssh_script(host, f"qdel {sid}" if sched == "pbs" else f"scancel {sid}")
+
+
+@mcp.tool()
+def run_on_compute(
+    host: str,
+    command: str,
+    account: str = "",
+    walltime: str = "00:30:00",
+    queue: str = "",
+    resources: str = "",
+    scheduler: str = "auto",
+    timeout: int = DEFAULT_COMPUTE_TIMEOUT,
+) -> str:
+    """Run one command on a compute node and wait for it, instead of on the login node.
+
+    Use this rather than execute_remote_bash for anything that runs longer
+    than a minute, uses more than a few GB of memory, or does heavy I/O:
+    NCAR and CURC terminate such processes on login nodes and may email or
+    flag the account. PBS uses NCAR's 'qcmd' (submits, waits, returns the
+    output); Slurm uses 'srun'. Blocks until the job finishes or timeout.
+
+    Args:
+        host: SSH config alias for the HPC system.
+        command: Bash command to run on the compute node.
+        account: Project / allocation to charge (PBS -A, Slurm --account).
+            Required on NCAR unless PBS_ACCOUNT is set in the remote environment.
+        walltime: HH:MM:SS wall-clock limit (default 00:30:00).
+        queue: PBS queue (e.g. 'main', 'casper', 'develop') or Slurm partition (e.g. 'amilan').
+        resources: PBS '-l' select string (e.g. 'select=1:ncpus=4:mem=16GB'), or on
+            Slurm comma-separated key=value pairs turned into srun flags
+            (e.g. 'qos=normal,ntasks=4,mem=16G').
+        scheduler: 'auto' (detect once per host), 'pbs' or 'slurm'.
+        timeout: Max seconds to wait including queue time (default 1800).
+    """
+    _validate_host(host)
+    _validate_timeout(timeout)
+    _validate_directive("account", account)
+    _validate_directive("queue", queue)
+    _validate_directive("resources", resources)
+    _validate_directive("walltime", walltime, _VALID_WALLTIME_RE)
+    sched = _resolve_scheduler(host, scheduler)
+    quoted = shlex.quote(command)
+    if sched == "pbs":
+        parts = ["qcmd"]
+        if account:
+            parts += ["-A", account]
+        if queue:
+            parts += ["-q", queue]
+        parts += ["-l", f"walltime={walltime}"]
+        if resources:
+            parts += ["-l", resources]
+        parts += ["--", "bash", "-c", quoted]
+    else:
+        parts = ["srun"]
+        if account:
+            parts.append(f"--account={account}")
+        if queue:
+            parts.append(f"--partition={queue}")
+        for pair in filter(None, resources.split(",")):
+            key, sep, value = pair.partition("=")
+            if not sep or not key or not value:
+                raise ValueError(f"Invalid resources entry {pair!r}; expected key=value")
+            parts.append(f"--{key}={value}")
+        parts.append(f"--time={walltime}")
+        parts += ["bash", "-c", quoted]
+    return _run_ssh_script(host, " ".join(parts), timeout=timeout)
 
 
 @mcp.tool()

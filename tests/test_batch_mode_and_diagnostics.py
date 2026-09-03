@@ -15,10 +15,10 @@ from ssh_hpc_server import (
     _ssh_cmd,
     _scp_cmd,
     execute_remote_bash,
-    submit_slurm_job,
-    check_slurm_job,
-    list_slurm_queue,
-    cancel_slurm_job,
+    submit_job,
+    check_job,
+    list_queue,
+    cancel_job,
     read_remote_file,
     tail_remote_file,
     scp_download_file,
@@ -85,24 +85,23 @@ class TestEveryToolUsesBatchSafeOpts:
             make_completed_process(returncode=0),
             make_completed_process(returncode=0, stdout="Submitted batch job 1\n"),
         ]
-        submit_slurm_job(host="derecho", job_script_content="#!/bin/bash", remote_filename="j.sh")
+        submit_job(scheduler="slurm", host="derecho", job_script_content="#!/bin/bash", remote_filename="j.sh")
         self._assert_opts_present(mock_subprocess.call_args_list[0][0][0])
         self._assert_opts_present(mock_subprocess.call_args_list[1][0][0])
 
-    def test_check_slurm_job_both_calls(self, mock_subprocess):
+    def test_check_job(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="ok\n")
-        check_slurm_job(host="derecho", job_id="12345")
-        self._assert_opts_present(mock_subprocess.call_args_list[0][0][0])
-        self._assert_opts_present(mock_subprocess.call_args_list[1][0][0])
+        check_job(scheduler="slurm", host="derecho", job_id="12345")
+        self._assert_opts_present(mock_subprocess.call_args[0][0])
 
     def test_list_slurm_queue(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0, stdout="header\n")
-        list_slurm_queue(host="derecho")
+        list_queue(scheduler="slurm", host="derecho")
         self._assert_opts_present(mock_subprocess.call_args[0][0])
 
     def test_cancel_slurm_job(self, mock_subprocess):
         mock_subprocess.return_value = make_completed_process(returncode=0)
-        cancel_slurm_job(host="derecho", job_id="12345")
+        cancel_job(scheduler="slurm", host="derecho", job_id="12345")
         self._assert_opts_present(mock_subprocess.call_args[0][0])
 
     def test_read_remote_file(self, mock_subprocess):
@@ -201,7 +200,7 @@ class TestDiagnosticHintAppearsInToolOutput:
             returncode=255,
             stderr="Permission denied (publickey,keyboard-interactive).",
         )
-        result = submit_slurm_job(host="derecho", job_script_content="#!/bin/bash")
+        result = submit_job(scheduler="slurm", host="derecho", job_script_content="#!/bin/bash")
         assert "Failed to write script" in result
         assert "ssh -fN derecho" in result
 

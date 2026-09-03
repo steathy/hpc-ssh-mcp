@@ -57,9 +57,9 @@ class TestLeadingDashHostRejection:
 
 class TestLeadingDashFilenameRejection:
     def test_submit_slurm_job_rejects_dash_filename(self):
-        from ssh_hpc_server import submit_slurm_job
+        from ssh_hpc_server import submit_job
         with pytest.raises(ValueError, match="must not start with"):
-            submit_slurm_job(
+            submit_job(scheduler="slurm",
                 host="derecho",
                 job_script_content="#!/bin/bash",
                 remote_filename="-malicious.sh",
@@ -71,10 +71,10 @@ class TestLeadingDashFilenameRejection:
             make_completed_process(returncode=0),
             make_completed_process(returncode=0, stdout="Submitted batch job 1\n"),
         ]
-        from ssh_hpc_server import submit_slurm_job
-        submit_slurm_job(host="derecho", job_script_content="#!/bin/bash", remote_filename="safe.sh")
-        sbatch_cmd = mock_subprocess.call_args_list[1][0][0][-1]
-        assert "sbatch -- " in sbatch_cmd
+        from ssh_hpc_server import submit_job
+        submit_job(scheduler="slurm", host="derecho", job_script_content="#!/bin/bash", remote_filename="safe.sh")
+        sbatch_script = mock_subprocess.call_args_list[1].kwargs["input"]
+        assert "sbatch -- " in sbatch_script
 
     def test_submit_slurm_job_uses_double_dash_for_chmod(self, mock_subprocess):
         """chmod must use -- to prevent filename-as-option interpretation."""
@@ -82,8 +82,8 @@ class TestLeadingDashFilenameRejection:
             make_completed_process(returncode=0),
             make_completed_process(returncode=0, stdout="Submitted batch job 1\n"),
         ]
-        from ssh_hpc_server import submit_slurm_job
-        submit_slurm_job(host="derecho", job_script_content="#!/bin/bash", remote_filename="safe.sh")
+        from ssh_hpc_server import submit_job
+        submit_job(scheduler="slurm", host="derecho", job_script_content="#!/bin/bash", remote_filename="safe.sh")
         chmod_cmd = mock_subprocess.call_args_list[0][0][0][-1]
         assert "chmod -- " in chmod_cmd
 
@@ -213,17 +213,18 @@ class TestMCPProtocol:
             assert info.version == ssh_hpc_server.__version__
 
     @pytest.mark.asyncio
-    async def test_tools_list_returns_all_ten_tools(self):
-        """tools/list must expose all 10 registered tools."""
+    async def test_tools_list_returns_all_registered_tools(self):
+        """tools/list must expose exactly the registered tools."""
         from fastmcp import Client
         import ssh_hpc_server
 
         expected_tools = {
             "execute_remote_bash",
-            "submit_slurm_job",
-            "check_slurm_job",
-            "cancel_slurm_job",
-            "list_slurm_queue",
+            "submit_job",
+            "check_job",
+            "cancel_job",
+            "list_queue",
+            "run_on_compute",
             "read_remote_file",
             "tail_remote_file",
             "scp_download_file",
